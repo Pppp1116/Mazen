@@ -85,6 +85,7 @@ static bool take_option_value(int argc, char **argv, int *index,
 void cli_options_init(CliOptions *options) {
   options->command = MAZEN_CMD_BUILD;
   options->verbose = false;
+  options->all_targets = false;
   options->jobs = 0;
   options->jobs_set = false;
   options->compiler = NULL;
@@ -212,6 +213,10 @@ bool cli_parse(int argc, char **argv, CliOptions *options, Diagnostic *diag) {
       options->verbose = true;
       continue;
     }
+    if (strcmp(arg, "--all-targets") == 0) {
+      options->all_targets = true;
+      continue;
+    }
     if (strcmp(arg, "--compiler") == 0 ||
         string_starts_with(arg, "--compiler=")) {
       const char *value = NULL;
@@ -320,6 +325,7 @@ void cli_print_help(void) {
   puts("Options:");
   puts("  --compiler PATH      Use a specific Clang binary");
   puts("  --target NAME        Build an explicit target from mazen.toml");
+  puts("  --all-targets        Build every resolved target in one pass");
   puts("  -j, --jobs COUNT     Compile sources in parallel");
   puts("  --std VALUE          Select the C language standard");
   puts("  --name NAME          Override output binary name");

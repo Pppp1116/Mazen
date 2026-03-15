@@ -7,6 +7,7 @@
 typedef struct {
     MazenCommand command;
     bool verbose;
+    bool all_targets;
     int jobs;
     bool jobs_set;
     char *compiler;

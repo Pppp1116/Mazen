@@ -473,6 +473,7 @@ void build_request_init(BuildRequest *request) {
     request->output_path = NULL;
     request->entry_path = NULL;
     request->compile_commands_path = NULL;
+    request->write_compile_commands = true;
     string_list_init(&request->source_paths);
     string_list_init(&request->include_dirs);
     string_list_init(&request->libs);
@@ -1139,6 +1140,24 @@ static bool write_compile_database(const char *path, const CompDbEntryList *comp
     return true;
 }
 
+bool build_write_compile_database(const char *root_dir, const char *path, const CompDbEntryList *compdb,
+                                  Diagnostic *diag) {
+    char *absolute;
+    bool ok;
+
+    if (path == NULL) {
+        return true;
+    }
+    if (!ensure_parent_directory(root_dir, path, diag)) {
+        return false;
+    }
+
+    absolute = resolve_path(root_dir, path);
+    ok = write_compile_database(absolute, compdb, diag);
+    free(absolute);
+    return ok;
+}
+
 static bool run_built_program(const ProjectInfo *project, const BuildRequest *request, const char *output_rel,
                               Diagnostic *diag) {
     StringList args;
@@ -1165,7 +1184,7 @@ static bool run_built_program(const ProjectInfo *project, const BuildRequest *re
 }
 
 bool build_project(const ProjectInfo *project, const MazenConfig *config, const BuildRequest *request,
-                   Diagnostic *diag) {
+                   CompDbEntryList *compdb_out, Diagnostic *diag) {
     CacheState state;
     BuildUnitList units;
     CompDbEntryList compdb;
@@ -1344,7 +1363,11 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
         return false;
     }
 
-    if (!write_compile_database(compdb_abs, &compdb, diag)) {
+    if (compdb_out != NULL) {
+        compdb_entry_list_append(compdb_out, &compdb);
+    }
+
+    if (request->write_compile_commands && !write_compile_database(compdb_abs, &compdb, diag)) {
         free(output_rel);
         free(output_abs);
         free(cache_rel);

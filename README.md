@@ -20,14 +20,16 @@ incremental rebuilds, and low friction for messy real-world trees.
 ## Features
 
 - Zero-config project discovery for C source trees
-- Explicit multi-target builds with named executables and libraries
+- Named executable, static-library, and shared-library targets
+- Batch builds with `--all-targets` for configured or discovered targets
 - Recursive scanning with sensible ignored directories
 - Entry-point inference with `main()` detection and target scoring
 - Automatic include directory inference from headers and `#include` usage
 - Clang-based incremental compilation with `.d` dependency files
 - Parallel compilation with `-j` and `--jobs`
 - `compile_commands.json` generation for editor and LSP tooling
-- Automatic inference for common system libraries like `m`, `pthread`, `dl`, and `rt`
+- Automatic inference for common system libraries like `m`, `pthread`, `dl`, `rt`, `curl`, `openssl`,
+  `sqlite3`, `glib-2.0`, `gobject-2.0`, `pango-1.0`, and more
 - Build cache stored in `build/.mazen/`
 - Richer `mazen.toml` overrides with target sections
 - Helpful commands for diagnostics and cleanup
@@ -190,6 +192,8 @@ mazen
 mazen --target app
 mazen run --target app
 mazen --target corelib
+mazen --all-targets
+mazen release --all-targets
 ```
 
 Parallel job control:
@@ -447,16 +451,30 @@ mazen --exclude examples
 
 The `doctor` command reports the active toolchain selection, including the
 compiler, resolved C standard, selected target, job count, and compile database
-path.
+path. With `mazen doctor --all-targets`, it also prints the full resolved target
+set for a batch build.
 
 ## Explicit Targets And Libraries
 
-When `mazen.toml` defines `[target.NAME]` sections, MAZEN resolves one target at
-a time:
+MAZEN supports debug and release builds for executable, static-library, and
+shared-library targets.
+
+By default, MAZEN resolves one target at a time. When `mazen.toml` defines
+`[target.NAME]` sections, you can either select a single target or build every
+resolved target in one pass with `--all-targets`:
 
 - executable targets produce binaries such as `build/app`
 - static library targets produce archives such as `build/libcore.a`
 - shared library targets produce shared objects such as `build/libcore.so`
+
+Examples:
+
+```sh
+mazen --target app
+mazen release --target plugin
+mazen --all-targets
+mazen release --all-targets
+```
 
 If multiple explicit targets exist, MAZEN uses this precedence:
 
@@ -465,17 +483,21 @@ If multiple explicit targets exist, MAZEN uses this precedence:
 3. a single `default = true` target
 4. the only configured target, if exactly one exists
 
-Otherwise MAZEN asks you to pick a target explicitly.
+Otherwise MAZEN asks you to pick a target explicitly, unless you build them all
+with `--all-targets`.
 
-Every build also refreshes a compile database for the active target. By
-default this is `compile_commands.json` in the project root, or the path set by
-`compile_commands_path`.
+Every build also refreshes a compile database. By default this is
+`compile_commands.json` in the project root, or the path set by
+`compile_commands_path`. Batch builds merge compile commands from every built
+target into a single compile database.
 
-MAZEN also tries to infer a few common system libraries automatically from
+MAZEN also tries to infer many common system libraries automatically from
 source usage, so projects using headers or symbols like `math.h`, `sqrt`,
-`pthread_create`, `dlopen`, or `clock_gettime` usually work without a manual
-`--lib` flag. Explicit `libs = [...]` and `--lib NAME` values still take
-precedence when you want to pin or extend the link set.
+`pthread_create`, `dlopen`, `clock_gettime`, `curl_easy_init`,
+`sqlite3_open`, `g_object_new`, `pango_layout_new`, `libusb_init`, or
+`PQconnectdb` usually work without a manual `--lib` flag. Explicit
+`libs = [...]` and `--lib NAME` values still take precedence when you want to
+pin or extend the link set.
 
 ## Typical Output
 

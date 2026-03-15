@@ -81,6 +81,21 @@ CompDbEntry *compdb_entry_list_push(CompDbEntryList *list) {
   return entry;
 }
 
+void compdb_entry_list_append(CompDbEntryList *dst, const CompDbEntryList *src) {
+  size_t i;
+
+  for (i = 0; i < src->len; ++i) {
+    CompDbEntry *entry = compdb_entry_list_push(dst);
+
+    entry->directory =
+        src->items[i].directory != NULL ? mazen_xstrdup(src->items[i].directory) : NULL;
+    entry->file = src->items[i].file != NULL ? mazen_xstrdup(src->items[i].file) : NULL;
+    entry->command =
+        src->items[i].command != NULL ? mazen_xstrdup(src->items[i].command) : NULL;
+    entry->output = src->items[i].output != NULL ? mazen_xstrdup(src->items[i].output) : NULL;
+  }
+}
+
 bool compdb_write(const char *path, const CompDbEntryList *list,
                   Diagnostic *diag) {
   String json;

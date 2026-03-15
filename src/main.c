@@ -95,13 +95,68 @@ static void populate_build_request(const CliOptions *cli, const MazenConfig *con
     }
 }
 
+static bool validate_cli_request(const CliOptions *cli, Diagnostic *diag) {
+    if (cli->all_targets && cli->target_name != NULL) {
+        diag_set(diag, "`--all-targets` cannot be combined with `--target NAME`");
+        return false;
+    }
+    if (cli->all_targets && cli->command == MAZEN_CMD_RUN) {
+        diag_set(diag, "`mazen run` only supports a single executable target");
+        diag_set_hint(diag, "Use `mazen --target NAME run` or build everything with `mazen --all-targets`");
+        return false;
+    }
+    return true;
+}
+
+static bool build_targets(const CliOptions *cli, const MazenConfig *config, const ProjectInfo *project,
+                          const ResolvedTargetList *targets, Diagnostic *diag) {
+    BuildRequest request;
+    CompDbEntryList compdb;
+    bool batch_compile_database = cli->all_targets || targets->len > 1;
+    const char *compile_commands_path =
+        config->compile_commands_path != NULL ? config->compile_commands_path : "compile_commands.json";
+    size_t i;
+    bool ok = false;
+
+    if (targets->len == 0) {
+        diag_set(diag, "no buildable targets were resolved");
+        return false;
+    }
+
+    build_request_init(&request);
+    compdb_entry_list_init(&compdb);
+
+    if (targets->len > 1) {
+        diag_info("Building %zu targets", targets->len);
+    }
+
+    for (i = 0; i < targets->len; ++i) {
+        populate_build_request(cli, config, project, &targets->items[i], &request);
+        request.write_compile_commands = !batch_compile_database;
+        if (!build_project(project, config, &request, batch_compile_database ? &compdb : NULL, diag)) {
+            goto out;
+        }
+    }
+
+    if (batch_compile_database && !build_write_compile_database(project->root_dir, compile_commands_path, &compdb, diag)) {
+        goto out;
+    }
+
+    ok = true;
+
+out:
+    compdb_entry_list_free(&compdb);
+    build_request_free(&request);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     CliOptions cli;
     MazenConfig config;
     ScanResult scan;
     ProjectInfo project;
-    BuildRequest request;
     ResolvedTarget target;
+    ResolvedTargetList targets;
     Diagnostic diag;
     char *root_dir;
     int exit_code = EXIT_SUCCESS;
@@ -110,8 +165,8 @@ int main(int argc, char **argv) {
     config_init(&config);
     scan_result_init(&scan);
     project_info_init(&project);
-    build_request_init(&request);
     resolved_target_init(&target);
+    resolved_target_list_init(&targets);
     diag_init(&diag);
 
     if (!cli_parse(argc, argv, &cli, &diag)) {
@@ -130,6 +185,11 @@ int main(int argc, char **argv) {
     }
     if (cli.command == MAZEN_CMD_STANDARDS) {
         mazen_standard_print_supported(stdout);
+        goto out;
+    }
+    if (!validate_cli_request(&cli, &diag)) {
+        diag_print_error(&diag);
+        exit_code = EXIT_FAILURE;
         goto out;
     }
 
@@ -183,16 +243,35 @@ int main(int argc, char **argv) {
 
     switch (cli.command) {
     case MAZEN_CMD_DOCTOR:
-        if (!mazen_target_resolve(&project, &config, cli.target_name, &target, &diag)) {
-            diag_print_error(&diag);
-            exit_code = EXIT_FAILURE;
-            break;
-        }
-        populate_build_request(&cli, &config, &project, &target, &request);
-        doctor_print_project(&project, &config, request.compiler, request.standard, &target, request.jobs,
-                             request.compile_commands_path);
-        if (config.targets.len > 0) {
-            mazen_target_print_list(&project, &config);
+        if (cli.all_targets) {
+            const MazenCStandard *standard = mazen_standard_select(cli.c_standard, config.c_standard);
+            int jobs = cli.jobs_set ? cli.jobs : (config.jobs_set ? config.jobs : 0);
+
+            if (!mazen_target_resolve_all(&project, &config, &targets, &diag)) {
+                diag_print_error(&diag);
+                exit_code = EXIT_FAILURE;
+                break;
+            }
+            doctor_print_project(&project, &config, cli.compiler != NULL ? cli.compiler : "clang", standard, NULL, jobs,
+                                 config.compile_commands_path != NULL ? config.compile_commands_path
+                                                                      : "compile_commands.json");
+            doctor_print_resolved_targets(&targets);
+        } else {
+            BuildRequest request;
+
+            if (!mazen_target_resolve(&project, &config, cli.target_name, &target, &diag)) {
+                diag_print_error(&diag);
+                exit_code = EXIT_FAILURE;
+                break;
+            }
+            build_request_init(&request);
+            populate_build_request(&cli, &config, &project, &target, &request);
+            doctor_print_project(&project, &config, request.compiler, request.standard, &target, request.jobs,
+                                 request.compile_commands_path);
+            build_request_free(&request);
+            if (config.targets.len > 0) {
+                mazen_target_print_list(&project, &config);
+            }
         }
         break;
     case MAZEN_CMD_LIST:
@@ -205,15 +284,31 @@ int main(int argc, char **argv) {
     case MAZEN_CMD_BUILD:
     case MAZEN_CMD_RUN:
     case MAZEN_CMD_RELEASE:
-        if (!mazen_target_resolve(&project, &config, cli.target_name, &target, &diag)) {
-            diag_print_error(&diag);
-            exit_code = EXIT_FAILURE;
-            break;
-        }
-        populate_build_request(&cli, &config, &project, &target, &request);
-        if (!build_project(&project, &config, &request, &diag)) {
-            diag_print_error(&diag);
-            exit_code = EXIT_FAILURE;
+        if (cli.all_targets) {
+            if (!mazen_target_resolve_all(&project, &config, &targets, &diag)) {
+                diag_print_error(&diag);
+                exit_code = EXIT_FAILURE;
+                break;
+            }
+            if (!build_targets(&cli, &config, &project, &targets, &diag)) {
+                diag_print_error(&diag);
+                exit_code = EXIT_FAILURE;
+            }
+        } else {
+            BuildRequest request;
+
+            if (!mazen_target_resolve(&project, &config, cli.target_name, &target, &diag)) {
+                diag_print_error(&diag);
+                exit_code = EXIT_FAILURE;
+                break;
+            }
+            build_request_init(&request);
+            populate_build_request(&cli, &config, &project, &target, &request);
+            if (!build_project(&project, &config, &request, NULL, &diag)) {
+                diag_print_error(&diag);
+                exit_code = EXIT_FAILURE;
+            }
+            build_request_free(&request);
         }
         break;
     default:
@@ -225,7 +320,7 @@ int main(int argc, char **argv) {
 
 out:
     diag_free(&diag);
-    build_request_free(&request);
+    resolved_target_list_free(&targets);
     resolved_target_free(&target);
     project_info_free(&project);
     scan_result_free(&scan);

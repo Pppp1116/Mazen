@@ -357,6 +357,106 @@ void resolved_target_free(ResolvedTarget *target) {
     resolved_target_init(target);
 }
 
+void resolved_target_list_init(ResolvedTargetList *list) {
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+void resolved_target_list_free(ResolvedTargetList *list) {
+    size_t i;
+
+    for (i = 0; i < list->len; ++i) {
+        resolved_target_free(&list->items[i]);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+static ResolvedTarget *resolved_target_list_push(ResolvedTargetList *list) {
+    size_t cap;
+
+    if (list->len == list->cap) {
+        cap = list->cap == 0 ? 4 : list->cap * 2;
+        list->items = mazen_xrealloc(list->items, cap * sizeof(*list->items));
+        list->cap = cap;
+    }
+
+    resolved_target_init(&list->items[list->len]);
+    return &list->items[list->len++];
+}
+
+static bool resolved_target_name_exists(const ResolvedTargetList *list, const char *name) {
+    size_t i;
+
+    for (i = 0; i < list->len; ++i) {
+        if (list->items[i].name != NULL && strcmp(list->items[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *make_unique_target_name(const ResolvedTargetList *list, const char *base_name) {
+    size_t suffix = 2;
+
+    if (!resolved_target_name_exists(list, base_name)) {
+        return mazen_xstrdup(base_name);
+    }
+
+    for (;;) {
+        char *candidate = mazen_format("%s_%zu", base_name, suffix++);
+        if (!resolved_target_name_exists(list, candidate)) {
+            return candidate;
+        }
+        free(candidate);
+    }
+}
+
+static bool determine_batch_default_name(const struct MazenConfig *config, const char **name_out, Diagnostic *diag) {
+    const MazenTargetConfig *chosen = NULL;
+    size_t i;
+    size_t default_count = 0;
+
+    *name_out = NULL;
+
+    if (config->default_target != NULL) {
+        chosen = mazen_target_config_list_find_const(&config->targets, config->default_target);
+        if (chosen == NULL) {
+            diag_set(diag, "default_target `%s` does not match a configured target", config->default_target);
+            return false;
+        }
+        *name_out = chosen->name;
+        return true;
+    }
+
+    for (i = 0; i < config->targets.len; ++i) {
+        if (config->targets.items[i].default_target) {
+            chosen = &config->targets.items[i];
+            ++default_count;
+        }
+    }
+
+    if (default_count == 1) {
+        *name_out = chosen->name;
+        return true;
+    }
+    if (config->targets.len == 1) {
+        *name_out = config->targets.items[0].name;
+    }
+    return true;
+}
+
+static char *legacy_batch_target_basename(const ProjectInfo *project, const struct MazenConfig *config,
+                                          const SourceFile *source, size_t source_index, size_t entry_count) {
+    if (entry_count == 1 || (project->has_selected_entry && source_index == project->selected_entry)) {
+        return mazen_xstrdup(config->name != NULL ? config->name : project->project_name);
+    }
+    return sanitize_stem(source->path);
+}
+
 static const MazenTargetConfig *select_config_target(const struct MazenConfig *config, const char *requested_name,
                                                      bool *is_default, Diagnostic *diag) {
     const MazenTargetConfig *chosen = NULL;
@@ -575,6 +675,85 @@ bool mazen_target_resolve(const ProjectInfo *project, const struct MazenConfig *
     }
 
     return resolve_config_target(project, config, target_cfg, is_default, resolved, diag);
+}
+
+bool mazen_target_resolve_all(const ProjectInfo *project, const struct MazenConfig *config, ResolvedTargetList *list,
+                              Diagnostic *diag) {
+    if (config->targets.len == 0) {
+        size_t i;
+        size_t entry_count = 0;
+
+        for (i = 0; i < project->sources.len; ++i) {
+            if (project->sources.items[i].has_main) {
+                ++entry_count;
+            }
+        }
+
+        if (entry_count <= 1) {
+            ResolvedTarget single;
+            ResolvedTarget *slot;
+
+            resolved_target_init(&single);
+            if (!mazen_target_resolve(project, config, NULL, &single, diag)) {
+                resolved_target_free(&single);
+                return false;
+            }
+            slot = resolved_target_list_push(list);
+            *slot = single;
+            return true;
+        }
+
+        for (i = 0; i < project->sources.len; ++i) {
+            const SourceFile *source = &project->sources.items[i];
+            ResolvedTarget *resolved;
+            char *base_name;
+            char *unique_name;
+
+            if (!source->has_main) {
+                continue;
+            }
+
+            resolved = resolved_target_list_push(list);
+            resolved->from_config = false;
+            resolved->is_default = project->has_selected_entry && i == project->selected_entry;
+            resolved->type = MAZEN_TARGET_EXECUTABLE;
+            base_name = legacy_batch_target_basename(project, config, source, i, entry_count);
+            unique_name = make_unique_target_name(list, base_name);
+            free(base_name);
+            resolved->name = unique_name;
+            resolved->output_path = mazen_format("build/%s", resolved->name);
+            resolved->entry_path = mazen_xstrdup(source->path);
+            collect_legacy_executable_sources(project, i, &resolved->source_paths);
+            string_list_push_unique(&resolved->source_paths, source->path);
+        }
+
+        return true;
+    }
+
+    {
+        const char *default_name = NULL;
+        size_t i;
+
+        if (!determine_batch_default_name(config, &default_name, diag)) {
+            return false;
+        }
+
+        for (i = 0; i < config->targets.len; ++i) {
+            ResolvedTarget resolved;
+            ResolvedTarget *slot;
+            bool is_default = default_name != NULL && strcmp(default_name, config->targets.items[i].name) == 0;
+
+            resolved_target_init(&resolved);
+            if (!resolve_config_target(project, config, &config->targets.items[i], is_default, &resolved, diag)) {
+                resolved_target_free(&resolved);
+                return false;
+            }
+            slot = resolved_target_list_push(list);
+            *slot = resolved;
+        }
+    }
+
+    return true;
 }
 
 void mazen_target_print_list(const ProjectInfo *project, const struct MazenConfig *config) {

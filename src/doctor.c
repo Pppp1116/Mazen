@@ -62,6 +62,29 @@ void doctor_print_project(const ProjectInfo *project, const MazenConfig *config,
     }
 }
 
+void doctor_print_resolved_targets(const ResolvedTargetList *targets) {
+    size_t i;
+
+    puts("Resolved targets:");
+    if (targets->len == 0) {
+        puts("    (none)");
+        return;
+    }
+
+    for (i = 0; i < targets->len; ++i) {
+        const ResolvedTarget *target = &targets->items[i];
+
+        printf("    %s type=%s output=%s", target->name, mazen_target_type_name(target->type), target->output_path);
+        if (target->entry_path != NULL) {
+            printf(" entry=%s", target->entry_path);
+        }
+        if (target->is_default) {
+            printf(" [default]");
+        }
+        putchar('\n');
+    }
+}
+
 void doctor_print_targets(const ProjectInfo *project) {
     size_t i;
     bool found = false;

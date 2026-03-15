@@ -48,6 +48,12 @@ typedef struct {
     StringList ldflags;
 } ResolvedTarget;
 
+typedef struct {
+    ResolvedTarget *items;
+    size_t len;
+    size_t cap;
+} ResolvedTargetList;
+
 void mazen_target_config_init(MazenTargetConfig *target);
 void mazen_target_config_free(MazenTargetConfig *target);
 void mazen_target_config_list_init(MazenTargetConfigList *list);
@@ -61,9 +67,13 @@ bool mazen_target_type_from_text(const char *text, MazenTargetType *type);
 
 void resolved_target_init(ResolvedTarget *target);
 void resolved_target_free(ResolvedTarget *target);
+void resolved_target_list_init(ResolvedTargetList *list);
+void resolved_target_list_free(ResolvedTargetList *list);
 
 bool mazen_target_resolve(const ProjectInfo *project, const struct MazenConfig *config, const char *requested_name,
                           ResolvedTarget *resolved, Diagnostic *diag);
+bool mazen_target_resolve_all(const ProjectInfo *project, const struct MazenConfig *config, ResolvedTargetList *list,
+                              Diagnostic *diag);
 void mazen_target_print_list(const ProjectInfo *project, const struct MazenConfig *config);
 
 #endif

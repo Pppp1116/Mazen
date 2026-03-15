@@ -3,6 +3,7 @@
 
 #include "cache.h"
 #include "cli.h"
+#include "compdb.h"
 #include "common.h"
 #include "config.h"
 #include "diag.h"
@@ -21,6 +22,7 @@ typedef struct {
     char *output_path;
     char *entry_path;
     char *compile_commands_path;
+    bool write_compile_commands;
     StringList source_paths;
     StringList include_dirs;
     StringList libs;
@@ -33,6 +35,8 @@ void build_request_init(BuildRequest *request);
 void build_request_free(BuildRequest *request);
 bool build_clean(const char *root_dir, const MazenConfig *config, Diagnostic *diag);
 bool build_project(const ProjectInfo *project, const MazenConfig *config, const BuildRequest *request,
-                   Diagnostic *diag);
+                   CompDbEntryList *compdb_out, Diagnostic *diag);
+bool build_write_compile_database(const char *root_dir, const char *path, const CompDbEntryList *compdb,
+                                  Diagnostic *diag);
 
 #endif
