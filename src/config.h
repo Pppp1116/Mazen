@@ -4,18 +4,25 @@
 #include "cli.h"
 #include "common.h"
 #include "diag.h"
+#include "target.h"
 
-typedef struct {
+typedef struct MazenConfig {
     bool present;
     char *path;
     char *name;
     char *c_standard;
+    int jobs;
+    bool jobs_set;
+    char *default_target;
+    char *compile_commands_path;
     StringList include_dirs;
     StringList libs;
     StringList exclude;
     StringList src_dirs;
+    StringList sources;
     StringList cflags;
     StringList ldflags;
+    MazenTargetConfigList targets;
 } MazenConfig;
 
 void config_init(MazenConfig *config);

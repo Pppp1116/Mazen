@@ -1,15 +1,31 @@
 #include "config.h"
-#include "standard.h"
 
+#include "standard.h"
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void config_string_list_merge(StringList *dst, const StringList *src) {
+typedef enum {
+    CONFIG_SECTION_GLOBAL = 0,
+    CONFIG_SECTION_TARGET
+} ConfigSectionKind;
+
+typedef struct {
+    ConfigSectionKind kind;
+    MazenTargetConfig *target;
+} ConfigSection;
+
+static void config_string_list_merge(StringList *dst, const StringList *src, bool unique) {
     size_t i;
+
     for (i = 0; i < src->len; ++i) {
-        string_list_push_unique(dst, src->items[i]);
+        if (unique) {
+            string_list_push_unique(dst, src->items[i]);
+        } else {
+            string_list_push(dst, src->items[i]);
+        }
     }
 }
 
@@ -40,6 +56,9 @@ static bool parse_quoted_value(const char **cursor, size_t line, char **out, Dia
             switch (**cursor) {
             case 'n':
                 string_append_char(&buffer, '\n');
+                break;
+            case 'r':
+                string_append_char(&buffer, '\r');
                 break;
             case 't':
                 string_append_char(&buffer, '\t');
@@ -86,6 +105,7 @@ static bool parse_string_value(const char *text, size_t line, char **out, Diagno
         diag_set(diag, "mazen.toml:%zu: unexpected trailing content", line);
         return false;
     }
+
     return true;
 }
 
@@ -138,6 +158,59 @@ static bool parse_string_array(const char *text, size_t line, StringList *list, 
     }
 }
 
+static bool parse_bool_value(const char *text, size_t line, bool *out, Diagnostic *diag) {
+    char *copy = mazen_xstrdup(text);
+    char *trimmed = trim_in_place(copy);
+    bool ok = true;
+
+    if (strcmp(trimmed, "true") == 0) {
+        *out = true;
+    } else if (strcmp(trimmed, "false") == 0) {
+        *out = false;
+    } else {
+        diag_set(diag, "mazen.toml:%zu: expected `true` or `false`", line);
+        ok = false;
+    }
+
+    free(copy);
+    return ok;
+}
+
+static bool parse_int_value(const char *text, size_t line, int *out, Diagnostic *diag) {
+    char *copy = mazen_xstrdup(text);
+    char *trimmed = trim_in_place(copy);
+    char *end = NULL;
+    long value;
+
+    if (*trimmed == '\0') {
+        free(copy);
+        diag_set(diag, "mazen.toml:%zu: expected integer value", line);
+        return false;
+    }
+
+    value = strtol(trimmed, &end, 10);
+    if (*end != '\0') {
+        free(copy);
+        diag_set(diag, "mazen.toml:%zu: expected integer value", line);
+        return false;
+    }
+    if (value <= 0) {
+        free(copy);
+        diag_set(diag, "mazen.toml:%zu: integer value must be greater than zero", line);
+        return false;
+    }
+    if (value > INT_MAX) {
+      free(copy);
+      diag_set(diag, "mazen.toml:%zu: integer value is too large", line);
+      return false;
+      
+    }
+
+    *out = (int) value;
+    free(copy);
+    return true;
+}
+
 static char *strip_comments(const char *line) {
     String cleaned;
     bool in_string = false;
@@ -163,6 +236,7 @@ static char *strip_comments(const char *line) {
         string_append_char(&cleaned, *cursor);
         ++cursor;
     }
+
     return string_take(&cleaned);
 }
 
@@ -213,29 +287,236 @@ static char *next_line(char **cursor) {
     return line;
 }
 
+static bool parse_section_header(const char *text, size_t line, ConfigSection *section, MazenConfig *config,
+                                 Diagnostic *diag) {
+    size_t len = strlen(text);
+    char *name;
+
+    if (len < 3 || text[0] != '[' || text[len - 1] != ']') {
+        diag_set(diag, "mazen.toml:%zu: malformed section header", line);
+        return false;
+    }
+
+    name = mazen_format("%.*s", (int) (len - 2), text + 1);
+    if (strcmp(name, "target") == 0) {
+        free(name);
+        diag_set(diag, "mazen.toml:%zu: target sections must use `[target.NAME]`", line);
+        return false;
+    }
+    if (string_starts_with(name, "target.")) {
+        const char *target_name = name + 7;
+        MazenTargetConfig *target;
+
+        if (*target_name == '\0') {
+            free(name);
+            diag_set(diag, "mazen.toml:%zu: target sections must use `[target.NAME]`", line);
+            return false;
+        }
+        if (mazen_target_config_list_find(&config->targets, target_name) != NULL) {
+            char *duplicate_name = mazen_xstrdup(target_name);
+            free(name);
+            diag_set(diag, "mazen.toml:%zu: duplicate target section `%s`", line, duplicate_name);
+            free(duplicate_name);
+            return false;
+        }
+
+        target = mazen_target_config_list_push(&config->targets, target_name);
+        section->kind = CONFIG_SECTION_TARGET;
+        section->target = target;
+        free(name);
+        return true;
+    }
+
+    free(name);
+    diag_set(diag, "mazen.toml:%zu: unsupported section header", line);
+    return false;
+}
+
+static bool assign_string_field(char **field, const char *value_text, size_t line, Diagnostic *diag) {
+    char *parsed = NULL;
+
+    if (!parse_string_value(value_text, line, &parsed, diag)) {
+        return false;
+    }
+
+    free(*field);
+    *field = parsed;
+    return true;
+}
+
+static bool assign_string_list_field(StringList *list, const char *value_text, size_t line, Diagnostic *diag) {
+    StringList parsed;
+    size_t i;
+
+    string_list_init(&parsed);
+    if (!parse_string_array(value_text, line, &parsed, diag)) {
+        string_list_free(&parsed);
+        return false;
+    }
+
+    string_list_clear(list);
+    for (i = 0; i < parsed.len; ++i) {
+        string_list_push(list, parsed.items[i]);
+    }
+    string_list_free(&parsed);
+    return true;
+}
+
+static bool assign_global_key(MazenConfig *config, const char *key, const char *value_text, size_t line,
+                              Diagnostic *diag) {
+    if (strcmp(key, "name") == 0) {
+        return assign_string_field(&config->name, value_text, line, diag);
+    }
+    if (strcmp(key, "c_standard") == 0) {
+        char *parsed = NULL;
+        if (!parse_string_value(value_text, line, &parsed, diag)) {
+            return false;
+        }
+        if (mazen_standard_find(parsed) == NULL) {
+            char *bad_value = mazen_xstrdup(parsed);
+            free(parsed);
+            diag_set(diag, "mazen.toml:%zu: unsupported c_standard `%s`", line, bad_value);
+            diag_set_hint(diag, "Run `mazen standards` to list supported values");
+            free(bad_value);
+            return false;
+        }
+        free(config->c_standard);
+        config->c_standard = parsed;
+        return true;
+    }
+    if (strcmp(key, "jobs") == 0) {
+        int jobs = 0;
+        if (!parse_int_value(value_text, line, &jobs, diag)) {
+            return false;
+        }
+        config->jobs = jobs;
+        config->jobs_set = true;
+        return true;
+    }
+    if (strcmp(key, "default_target") == 0) {
+        return assign_string_field(&config->default_target, value_text, line, diag);
+    }
+    if (strcmp(key, "compile_commands_path") == 0) {
+        return assign_string_field(&config->compile_commands_path, value_text, line, diag);
+    }
+    if (strcmp(key, "include_dirs") == 0) {
+        return assign_string_list_field(&config->include_dirs, value_text, line, diag);
+    }
+    if (strcmp(key, "libs") == 0) {
+        return assign_string_list_field(&config->libs, value_text, line, diag);
+    }
+    if (strcmp(key, "exclude") == 0) {
+        return assign_string_list_field(&config->exclude, value_text, line, diag);
+    }
+    if (strcmp(key, "src_dirs") == 0) {
+        return assign_string_list_field(&config->src_dirs, value_text, line, diag);
+    }
+    if (strcmp(key, "sources") == 0) {
+        return assign_string_list_field(&config->sources, value_text, line, diag);
+    }
+    if (strcmp(key, "cflags") == 0) {
+        return assign_string_list_field(&config->cflags, value_text, line, diag);
+    }
+    if (strcmp(key, "ldflags") == 0) {
+        return assign_string_list_field(&config->ldflags, value_text, line, diag);
+    }
+
+    diag_set(diag, "mazen.toml:%zu: unsupported key `%s`", line, key);
+    return false;
+}
+
+static bool assign_target_key(MazenTargetConfig *target, const char *key, const char *value_text, size_t line,
+                              Diagnostic *diag) {
+    if (strcmp(key, "type") == 0) {
+        char *parsed = NULL;
+        MazenTargetType type;
+
+        if (!parse_string_value(value_text, line, &parsed, diag)) {
+            return false;
+        }
+        if (!mazen_target_type_from_text(parsed, &type)) {
+            diag_set(diag, "mazen.toml:%zu: unsupported target type `%s`", line, parsed);
+            free(parsed);
+            return false;
+        }
+        target->type = type;
+        target->type_set = true;
+        free(parsed);
+        return true;
+    }
+    if (strcmp(key, "default") == 0) {
+        bool value = false;
+        if (!parse_bool_value(value_text, line, &value, diag)) {
+            return false;
+        }
+        target->default_target = value;
+        return true;
+    }
+    if (strcmp(key, "entry") == 0) {
+        return assign_string_field(&target->entry, value_text, line, diag);
+    }
+    if (strcmp(key, "output") == 0) {
+        return assign_string_field(&target->output, value_text, line, diag);
+    }
+    if (strcmp(key, "src_dirs") == 0) {
+        return assign_string_list_field(&target->src_dirs, value_text, line, diag);
+    }
+    if (strcmp(key, "include_dirs") == 0) {
+        return assign_string_list_field(&target->include_dirs, value_text, line, diag);
+    }
+    if (strcmp(key, "libs") == 0) {
+        return assign_string_list_field(&target->libs, value_text, line, diag);
+    }
+    if (strcmp(key, "cflags") == 0) {
+        return assign_string_list_field(&target->cflags, value_text, line, diag);
+    }
+    if (strcmp(key, "ldflags") == 0) {
+        return assign_string_list_field(&target->ldflags, value_text, line, diag);
+    }
+    if (strcmp(key, "sources") == 0) {
+        return assign_string_list_field(&target->sources, value_text, line, diag);
+    }
+    if (strcmp(key, "exclude") == 0) {
+        return assign_string_list_field(&target->exclude, value_text, line, diag);
+    }
+
+    diag_set(diag, "mazen.toml:%zu: unsupported target key `%s`", line, key);
+    return false;
+}
+
 void config_init(MazenConfig *config) {
     config->present = false;
     config->path = NULL;
     config->name = NULL;
     config->c_standard = NULL;
+    config->jobs = 0;
+    config->jobs_set = false;
+    config->default_target = NULL;
+    config->compile_commands_path = NULL;
     string_list_init(&config->include_dirs);
     string_list_init(&config->libs);
     string_list_init(&config->exclude);
     string_list_init(&config->src_dirs);
+    string_list_init(&config->sources);
     string_list_init(&config->cflags);
     string_list_init(&config->ldflags);
+    mazen_target_config_list_init(&config->targets);
 }
 
 void config_free(MazenConfig *config) {
     free(config->path);
     free(config->name);
     free(config->c_standard);
+    free(config->default_target);
+    free(config->compile_commands_path);
     string_list_free(&config->include_dirs);
     string_list_free(&config->libs);
     string_list_free(&config->exclude);
     string_list_free(&config->src_dirs);
+    string_list_free(&config->sources);
     string_list_free(&config->cflags);
     string_list_free(&config->ldflags);
+    mazen_target_config_list_free(&config->targets);
     config_init(config);
 }
 
@@ -245,6 +526,7 @@ bool config_load(const char *root_dir, MazenConfig *config, Diagnostic *diag) {
     char *cursor;
     char *line;
     size_t line_number = 0;
+    ConfigSection section;
 
     if (!file_exists(path)) {
         free(path);
@@ -258,25 +540,36 @@ bool config_load(const char *root_dir, MazenConfig *config, Diagnostic *diag) {
         return false;
     }
 
+    section.kind = CONFIG_SECTION_GLOBAL;
+    section.target = NULL;
     config->present = true;
     config->path = path;
 
     cursor = content;
-    line = next_line(&cursor);
-    while (line != NULL) {
+    for (line = next_line(&cursor); line != NULL; line = next_line(&cursor)) {
         char *cleaned;
         char *trimmed;
         char *equals;
         char *key;
         char *value_text;
         char *value_copy = NULL;
+        bool ok = false;
 
         ++line_number;
         cleaned = strip_comments(line);
         trimmed = trim_in_place(cleaned);
         if (*trimmed == '\0') {
             free(cleaned);
-            line = next_line(&cursor);
+            continue;
+        }
+
+        if (trimmed[0] == '[') {
+            ok = parse_section_header(trimmed, line_number, &section, config, diag);
+            free(cleaned);
+            if (!ok) {
+                free(content);
+                return false;
+            }
             continue;
         }
 
@@ -321,90 +614,18 @@ bool config_load(const char *root_dir, MazenConfig *config, Diagnostic *diag) {
             value_copy = mazen_xstrdup(value_text);
         }
 
-        if (strcmp(key, "name") == 0) {
-            char *parsed = NULL;
-            if (!parse_string_value(value_copy, line_number, &parsed, diag)) {
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                return false;
-            }
-            free(config->name);
-            config->name = parsed;
-        } else if (strcmp(key, "c_standard") == 0) {
-            char *parsed = NULL;
-            if (!parse_string_value(value_copy, line_number, &parsed, diag)) {
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                return false;
-            }
-            if (mazen_standard_find(parsed) == NULL) {
-                char *bad_value = mazen_xstrdup(parsed);
-                free(parsed);
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                diag_set(diag, "mazen.toml:%zu: unsupported c_standard `%s`", line_number, bad_value);
-                diag_set_hint(diag, "Run `mazen standards` to list supported values");
-                free(bad_value);
-                return false;
-            }
-            free(config->c_standard);
-            config->c_standard = parsed;
-        } else if (strcmp(key, "include_dirs") == 0) {
-            if (!parse_string_array(value_copy, line_number, &config->include_dirs, diag)) {
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                return false;
-            }
-        } else if (strcmp(key, "libs") == 0) {
-            if (!parse_string_array(value_copy, line_number, &config->libs, diag)) {
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                return false;
-            }
-        } else if (strcmp(key, "exclude") == 0) {
-            if (!parse_string_array(value_copy, line_number, &config->exclude, diag)) {
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                return false;
-            }
-        } else if (strcmp(key, "src_dirs") == 0) {
-            if (!parse_string_array(value_copy, line_number, &config->src_dirs, diag)) {
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                return false;
-            }
-        } else if (strcmp(key, "cflags") == 0) {
-            if (!parse_string_array(value_copy, line_number, &config->cflags, diag)) {
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                return false;
-            }
-        } else if (strcmp(key, "ldflags") == 0) {
-            if (!parse_string_array(value_copy, line_number, &config->ldflags, diag)) {
-                free(value_copy);
-                free(cleaned);
-                free(content);
-                return false;
-            }
+        if (section.kind == CONFIG_SECTION_GLOBAL) {
+            ok = assign_global_key(config, key, value_copy, line_number, diag);
         } else {
-            free(value_copy);
-            free(cleaned);
-            free(content);
-            diag_set(diag, "mazen.toml:%zu: unsupported key `%s`", line_number, key);
-            return false;
+            ok = assign_target_key(section.target, key, value_copy, line_number, diag);
         }
 
         free(value_copy);
         free(cleaned);
-        line = next_line(&cursor);
+        if (!ok) {
+            free(content);
+            return false;
+        }
     }
 
     free(content);
@@ -420,11 +641,15 @@ void config_merge_cli(MazenConfig *config, const CliOptions *options) {
         free(config->c_standard);
         config->c_standard = mazen_xstrdup(options->c_standard);
     }
+    if (options->jobs_set) {
+        config->jobs = options->jobs;
+        config->jobs_set = true;
+    }
 
-    config_string_list_merge(&config->include_dirs, &options->include_dirs);
-    config_string_list_merge(&config->libs, &options->libs);
-    config_string_list_merge(&config->exclude, &options->excludes);
-    config_string_list_merge(&config->src_dirs, &options->src_dirs);
-    config_string_list_merge(&config->cflags, &options->cflags);
-    config_string_list_merge(&config->ldflags, &options->ldflags);
+    config_string_list_merge(&config->include_dirs, &options->include_dirs, true);
+    config_string_list_merge(&config->libs, &options->libs, true);
+    config_string_list_merge(&config->exclude, &options->excludes, true);
+    config_string_list_merge(&config->src_dirs, &options->src_dirs, true);
+    config_string_list_merge(&config->cflags, &options->cflags, false);
+    config_string_list_merge(&config->ldflags, &options->ldflags, false);
 }

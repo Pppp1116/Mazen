@@ -1,5 +1,8 @@
 #include "build.h"
 
+#include "autolib.h"
+#include "compdb.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +13,7 @@
 
 typedef struct {
     const SourceFile *source;
+    char *source_abs;
     char *object_rel;
     char *dep_rel;
     char *object_abs;
@@ -23,23 +27,25 @@ typedef struct {
     size_t cap;
 } BuildUnitList;
 
-typedef enum {
-    PATH_CONTEXT_GENERAL = 0,
-    PATH_CONTEXT_TOOL,
-    PATH_CONTEXT_EXAMPLE,
-    PATH_CONTEXT_TEST,
-    PATH_CONTEXT_EXPERIMENTAL
-} PathContext;
+typedef struct {
+    BuildUnit *unit;
+    StringList args;
+} CompileTask;
 
-static const char *CONTEXT_TOOL_NAMES[] = {"tool", "tools", "script", "scripts"};
-static const char *CONTEXT_EXAMPLE_NAMES[] = {"example", "examples", "demo", "demos", "sample", "samples"};
-static const char *CONTEXT_TEST_NAMES[] = {"test", "tests", "spec", "specs"};
-static const char *CONTEXT_EXPERIMENT_NAMES[] = {
-    "experiment", "experiments", "old", "backup", "scratch", "playground"
-};
+typedef struct {
+    CompileTask *items;
+    size_t len;
+    size_t cap;
+} CompileTaskList;
+
+typedef struct {
+    pid_t pid;
+    CompileTask *task;
+} RunningCompile;
 
 static void build_unit_init(BuildUnit *unit) {
     unit->source = NULL;
+    unit->source_abs = NULL;
     unit->object_rel = NULL;
     unit->dep_rel = NULL;
     unit->object_abs = NULL;
@@ -48,6 +54,7 @@ static void build_unit_init(BuildUnit *unit) {
 }
 
 static void build_unit_free(BuildUnit *unit) {
+    free(unit->source_abs);
     free(unit->object_rel);
     free(unit->dep_rel);
     free(unit->object_abs);
@@ -64,6 +71,7 @@ static void build_unit_list_init(BuildUnitList *list) {
 
 static void build_unit_list_free(BuildUnitList *list) {
     size_t i;
+
     for (i = 0; i < list->len; ++i) {
         build_unit_free(&list->items[i]);
     }
@@ -75,22 +83,67 @@ static void build_unit_list_free(BuildUnitList *list) {
 
 static BuildUnit *build_unit_list_push(BuildUnitList *list) {
     size_t cap;
+
     if (list->len == list->cap) {
         cap = list->cap == 0 ? 8 : list->cap * 2;
         list->items = mazen_xrealloc(list->items, cap * sizeof(*list->items));
         list->cap = cap;
     }
+
     build_unit_init(&list->items[list->len]);
+    return &list->items[list->len++];
+}
+
+static void compile_task_init(CompileTask *task) {
+    task->unit = NULL;
+    string_list_init(&task->args);
+}
+
+static void compile_task_free(CompileTask *task) {
+    string_list_free(&task->args);
+    compile_task_init(task);
+}
+
+static void compile_task_list_init(CompileTaskList *list) {
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+static void compile_task_list_free(CompileTaskList *list) {
+    size_t i;
+
+    for (i = 0; i < list->len; ++i) {
+        compile_task_free(&list->items[i]);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+static CompileTask *compile_task_list_push(CompileTaskList *list) {
+    size_t cap;
+
+    if (list->len == list->cap) {
+        cap = list->cap == 0 ? 8 : list->cap * 2;
+        list->items = mazen_xrealloc(list->items, cap * sizeof(*list->items));
+        list->cap = cap;
+    }
+
+    compile_task_init(&list->items[list->len]);
     return &list->items[list->len++];
 }
 
 static void append_quoted_arg(String *buffer, const char *arg) {
     size_t i;
     bool needs_quotes = strchr(arg, ' ') != NULL || strchr(arg, '\t') != NULL;
+
     if (!needs_quotes) {
         string_append(buffer, arg);
         return;
     }
+
     string_append_char(buffer, '\'');
     for (i = 0; arg[i] != '\0'; ++i) {
         if (arg[i] == '\'') {
@@ -105,6 +158,7 @@ static void append_quoted_arg(String *buffer, const char *arg) {
 static char *format_command(const StringList *args) {
     String text;
     size_t i;
+
     string_init(&text);
     for (i = 0; i < args->len; ++i) {
         if (i > 0) {
@@ -118,6 +172,7 @@ static char *format_command(const StringList *args) {
 static char **argv_from_list(const StringList *args) {
     char **argv = mazen_xcalloc(args->len + 1, sizeof(*argv));
     size_t i;
+
     for (i = 0; i < args->len; ++i) {
         argv[i] = args->items[i];
     }
@@ -241,98 +296,125 @@ static bool run_command_passthrough(const char *cwd, const StringList *args, Dia
     return false;
 }
 
-static void print_include_dirs(const ProjectInfo *project) {
+static bool spawn_command(const char *cwd, const StringList *args, pid_t *pid_out, Diagnostic *diag) {
+    pid_t child;
+    char **argv;
+
+    fflush(stdout);
+    fflush(stderr);
+
+    child = fork();
+    if (child < 0) {
+        diag_set(diag, "failed to fork: %s", strerror(errno));
+        return false;
+    }
+
+    if (child == 0) {
+        argv = argv_from_list(args);
+        if (cwd != NULL && chdir(cwd) != 0) {
+            fprintf(stderr, "failed to enter %s: %s\n", cwd, strerror(errno));
+            _exit(127);
+        }
+        execvp(argv[0], argv);
+        fprintf(stderr, "failed to execute %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    *pid_out = child;
+    return true;
+}
+
+static void build_request_copy_list(StringList *dst, const StringList *src, bool unique) {
     size_t i;
+
+    for (i = 0; i < src->len; ++i) {
+        if (unique) {
+            string_list_push_unique(dst, src->items[i]);
+        } else {
+            string_list_push(dst, src->items[i]);
+        }
+    }
+}
+
+static char *format_item_list(const StringList *items) {
+    String text;
+    size_t i;
+
+    string_init(&text);
+    for (i = 0; i < items->len; ++i) {
+        if (i > 0) {
+            string_append(&text, ", ");
+        }
+        string_append(&text, items->items[i]);
+    }
+    return string_take(&text);
+}
+
+static bool path_is_absolute(const char *path) {
+    return path != NULL && path[0] == '/';
+}
+
+static char *resolve_path(const char *root_dir, const char *path) {
+    if (path_is_absolute(path)) {
+        return mazen_xstrdup(path);
+    }
+    return path_join(root_dir, path);
+}
+
+static bool ensure_parent_directory(const char *root_dir, const char *path, Diagnostic *diag) {
+    char *dir_name = path_dirname(path);
+    char *dir_path = path_is_absolute(path) ? mazen_xstrdup(dir_name) : path_join(root_dir, dir_name);
+    int rc = ensure_directory(dir_path);
+
+    free(dir_name);
+    free(dir_path);
+    if (rc != 0) {
+        diag_set(diag, "failed to create directory for `%s`", path);
+        return false;
+    }
+    return true;
+}
+
+static int effective_job_count(const BuildRequest *request) {
+    long detected;
+
+    if (request->jobs > 0) {
+        return request->jobs;
+    }
+
+    detected = sysconf(_SC_NPROCESSORS_ONLN);
+    if (detected < 1) {
+        return 1;
+    }
+    return (int) detected;
+}
+
+static void print_include_dirs(const BuildRequest *request) {
+    size_t i;
+
     puts("Include directories:");
-    for (i = 0; i < project->include_dirs.len; ++i) {
-        printf("    %s\n", project->include_dirs.items[i]);
+    if (request->include_dirs.len == 0) {
+        puts("    (none)");
+        return;
+    }
+    for (i = 0; i < request->include_dirs.len; ++i) {
+        printf("    %s\n", request->include_dirs.items[i]);
     }
 }
 
-static bool path_matches_any_component(const char *path, const char *const *items, size_t count) {
+static const SourceFile *project_find_source(const ProjectInfo *project, const char *path) {
     size_t i;
-    for (i = 0; i < count; ++i) {
-        if (path_has_component(path, items[i])) {
-            return true;
+
+    for (i = 0; i < project->sources.len; ++i) {
+        if (strcmp(project->sources.items[i].path, path) == 0) {
+            return &project->sources.items[i];
         }
     }
-    return false;
+
+    return NULL;
 }
 
-static PathContext source_path_context(const SourceFile *source) {
-    if (path_matches_any_component(source->path, CONTEXT_TEST_NAMES, MAZEN_ARRAY_LEN(CONTEXT_TEST_NAMES))) {
-        return PATH_CONTEXT_TEST;
-    }
-    if (path_matches_any_component(source->path, CONTEXT_EXAMPLE_NAMES, MAZEN_ARRAY_LEN(CONTEXT_EXAMPLE_NAMES))) {
-        return PATH_CONTEXT_EXAMPLE;
-    }
-    if (path_matches_any_component(source->path, CONTEXT_EXPERIMENT_NAMES,
-                                   MAZEN_ARRAY_LEN(CONTEXT_EXPERIMENT_NAMES))) {
-        return PATH_CONTEXT_EXPERIMENTAL;
-    }
-    if (path_matches_any_component(source->path, CONTEXT_TOOL_NAMES, MAZEN_ARRAY_LEN(CONTEXT_TOOL_NAMES))) {
-        return PATH_CONTEXT_TOOL;
-    }
-    return PATH_CONTEXT_GENERAL;
-}
-
-static bool include_source_for_target(const ProjectInfo *project, size_t index) {
-    const SourceFile *selected;
-    const SourceFile *source;
-    PathContext selected_context;
-    PathContext source_context;
-
-    if (!project->has_selected_entry) {
-        return false;
-    }
-
-    selected = &project->sources.items[project->selected_entry];
-    source = &project->sources.items[index];
-    selected_context = source_path_context(selected);
-    source_context = source_path_context(source);
-
-    if (index == project->selected_entry) {
-        return true;
-    }
-    if (source->has_main) {
-        return false;
-    }
-
-    switch (selected_context) {
-    case PATH_CONTEXT_TOOL:
-        if (source_context != PATH_CONTEXT_GENERAL && source_context != PATH_CONTEXT_TOOL) {
-            return false;
-        }
-        return source->role == SOURCE_ROLE_GENERAL || source->role == SOURCE_ROLE_VENDOR ||
-               source->role == SOURCE_ROLE_TOOL;
-    case PATH_CONTEXT_EXAMPLE:
-        if (source_context != PATH_CONTEXT_GENERAL && source_context != PATH_CONTEXT_EXAMPLE) {
-            return false;
-        }
-        return source->role == SOURCE_ROLE_GENERAL || source->role == SOURCE_ROLE_VENDOR ||
-               source->role == SOURCE_ROLE_EXAMPLE;
-    case PATH_CONTEXT_TEST:
-        if (source_context != PATH_CONTEXT_GENERAL && source_context != PATH_CONTEXT_TEST) {
-            return false;
-        }
-        return source->role == SOURCE_ROLE_GENERAL || source->role == SOURCE_ROLE_VENDOR ||
-               source->role == SOURCE_ROLE_TEST;
-    case PATH_CONTEXT_EXPERIMENTAL:
-        if (source_context != PATH_CONTEXT_GENERAL && source_context != PATH_CONTEXT_EXPERIMENTAL) {
-            return false;
-        }
-        return source->role == SOURCE_ROLE_GENERAL || source->role == SOURCE_ROLE_VENDOR ||
-               source->role == SOURCE_ROLE_EXPERIMENTAL;
-    case PATH_CONTEXT_GENERAL:
-    default:
-        if (source_context != PATH_CONTEXT_GENERAL) {
-            return false;
-        }
-        return source->role == SOURCE_ROLE_GENERAL || source->role == SOURCE_ROLE_VENDOR;
-    }
-}
-
-static void make_signatures(const ProjectInfo *project, const BuildRequest *request, char **compile_sig,
+static void make_signatures(const BuildRequest *request, const StringList *link_libs, char **compile_sig,
                             char **link_sig) {
     String compile;
     String link;
@@ -343,22 +425,31 @@ static void make_signatures(const ProjectInfo *project, const BuildRequest *requ
     string_init(&compile);
     string_init(&link);
 
-    string_appendf(&compile, "compiler=%s\nmode=%d\nstandard=%s\n", request->compiler, (int) request->mode,
-                   request->standard != NULL ? request->standard->name : mazen_standard_default()->name);
-    string_appendf(&link, "compiler=%s\nmode=%d\nbinary=%s\n", request->compiler, (int) request->mode,
-                   request->binary_name);
+    string_appendf(&compile, "compiler=%s\nmode=%d\nstandard=%s\ntype=%d\n", request->compiler,
+                   (int) request->mode,
+                   request->standard != NULL ? request->standard->name : mazen_standard_default()->name,
+                   (int) request->target_type);
+    string_appendf(&link, "compiler=%s\nmode=%d\ntype=%d\noutput=%s\n", request->compiler, (int) request->mode,
+                   (int) request->target_type, request->output_path != NULL ? request->output_path : "");
 
-    for (i = 0; i < project->include_dirs.len; ++i) {
-        string_appendf(&compile, "I=%s\n", project->include_dirs.items[i]);
+    if (request->entry_path != NULL) {
+        string_appendf(&link, "entry=%s\n", request->entry_path);
+    }
+    for (i = 0; i < request->include_dirs.len; ++i) {
+        string_appendf(&compile, "I=%s\n", request->include_dirs.items[i]);
     }
     for (i = 0; i < request->cflags.len; ++i) {
         string_appendf(&compile, "C=%s\n", request->cflags.items[i]);
     }
-    for (i = 0; i < request->libs.len; ++i) {
-        string_appendf(&link, "L=%s\n", request->libs.items[i]);
-    }
     for (i = 0; i < request->ldflags.len; ++i) {
         string_appendf(&link, "F=%s\n", request->ldflags.items[i]);
+    }
+    for (i = 0; i < link_libs->len; ++i) {
+        string_appendf(&link, "L=%s\n", link_libs->items[i]);
+    }
+    for (i = 0; i < request->source_paths.len; ++i) {
+        string_appendf(&compile, "S=%s\n", request->source_paths.items[i]);
+        string_appendf(&link, "S=%s\n", request->source_paths.items[i]);
     }
 
     compile_hash = fnv1a_hash_string(compile.data == NULL ? "" : compile.data, UINT64_C(1469598103934665603));
@@ -370,24 +461,20 @@ static void make_signatures(const ProjectInfo *project, const BuildRequest *requ
     string_free(&link);
 }
 
-static void build_request_copy_list(StringList *dst, const StringList *src, bool unique) {
-    size_t i;
-    for (i = 0; i < src->len; ++i) {
-        if (unique) {
-            string_list_push_unique(dst, src->items[i]);
-        } else {
-            string_list_push(dst, src->items[i]);
-        }
-    }
-}
-
 void build_request_init(BuildRequest *request) {
     request->compiler = "clang";
     request->standard = mazen_standard_default();
     request->mode = MAZEN_BUILD_DEBUG;
     request->run_after_build = false;
     request->verbose = false;
-    request->binary_name = NULL;
+    request->jobs = 0;
+    request->target_name = NULL;
+    request->target_type = MAZEN_TARGET_EXECUTABLE;
+    request->output_path = NULL;
+    request->entry_path = NULL;
+    request->compile_commands_path = NULL;
+    string_list_init(&request->source_paths);
+    string_list_init(&request->include_dirs);
     string_list_init(&request->libs);
     string_list_init(&request->cflags);
     string_list_init(&request->ldflags);
@@ -395,7 +482,12 @@ void build_request_init(BuildRequest *request) {
 }
 
 void build_request_free(BuildRequest *request) {
-    free(request->binary_name);
+    free(request->target_name);
+    free(request->output_path);
+    free(request->entry_path);
+    free(request->compile_commands_path);
+    string_list_free(&request->source_paths);
+    string_list_free(&request->include_dirs);
     string_list_free(&request->libs);
     string_list_free(&request->cflags);
     string_list_free(&request->ldflags);
@@ -403,93 +495,208 @@ void build_request_free(BuildRequest *request) {
     build_request_init(request);
 }
 
-bool build_clean(const char *root_dir, Diagnostic *diag) {
-    char *build_dir = path_join(root_dir, "build");
+static bool remove_optional_path(const char *root_dir, const char *path, Diagnostic *diag) {
+    char *absolute;
     int rc;
 
-    if (!dir_exists(build_dir)) {
-        diag_info("No build directory to clean");
-        free(build_dir);
+    if (path == NULL || *path == '\0') {
         return true;
     }
 
-    rc = remove_tree(build_dir);
+    absolute = resolve_path(root_dir, path);
+    if (!file_exists(absolute) && !dir_exists(absolute)) {
+        free(absolute);
+        return true;
+    }
+
+    rc = remove_tree(absolute);
     if (rc != 0) {
-        diag_set(diag, "failed to remove `%s`: %s", build_dir, strerror(errno));
-        free(build_dir);
+        diag_set(diag, "failed to remove `%s`: %s", absolute, strerror(errno));
+        free(absolute);
         return false;
     }
 
-    diag_info("Removed build artifacts");
-    free(build_dir);
+    free(absolute);
     return true;
 }
 
-static void create_build_units(const ProjectInfo *project, BuildUnitList *units) {
+bool build_clean(const char *root_dir, const MazenConfig *config, Diagnostic *diag) {
+    bool removed_any = false;
+    char *build_dir = path_join(root_dir, "build");
+    size_t i;
+
+    if (dir_exists(build_dir)) {
+        if (remove_tree(build_dir) != 0) {
+            diag_set(diag, "failed to remove `%s`: %s", build_dir, strerror(errno));
+            free(build_dir);
+            return false;
+        }
+        removed_any = true;
+    }
+    free(build_dir);
+
+    if (config != NULL) {
+        const char *compdb_path = config->compile_commands_path != NULL ? config->compile_commands_path
+                                                                        : "compile_commands.json";
+        {
+            char *abs = resolve_path(root_dir, compdb_path);
+            bool existed = file_exists(abs) || dir_exists(abs);
+            free(abs);
+            if (!remove_optional_path(root_dir, compdb_path, diag)) {
+                return false;
+            }
+            if (existed) {
+                removed_any = true;
+            }
+        }
+
+        for (i = 0; i < config->targets.len; ++i) {
+            const MazenTargetConfig *target = &config->targets.items[i];
+            if (target->output != NULL) {
+                char *abs = resolve_path(root_dir, target->output);
+                bool existed = file_exists(abs) || dir_exists(abs);
+                free(abs);
+                if (!remove_optional_path(root_dir, target->output, diag)) {
+                    return false;
+                }
+                if (existed) {
+                    removed_any = true;
+                }
+            }
+        }
+    } else {
+        char *abs = resolve_path(root_dir, "compile_commands.json");
+        bool existed = file_exists(abs) || dir_exists(abs);
+        free(abs);
+        if (!remove_optional_path(root_dir, "compile_commands.json", diag)) {
+            return false;
+        }
+        if (existed) {
+            removed_any = true;
+        }
+    }
+
+    if (removed_any) {
+        diag_info("Removed build artifacts");
+    } else {
+        diag_info("No build artifacts to clean");
+    }
+    return true;
+}
+
+static bool create_build_units(const ProjectInfo *project, const BuildRequest *request, BuildUnitList *units,
+                               Diagnostic *diag) {
     StringList used;
+    char *namespace_stem = NULL;
     size_t i;
 
     string_list_init(&used);
 
-    for (i = 0; i < project->sources.len; ++i) {
+    if (request->source_paths.len == 0) {
+        string_list_free(&used);
+        diag_set(diag, "target `%s` did not resolve any source files",
+                 request->target_name != NULL ? request->target_name : "(unnamed)");
+        return false;
+    }
+
+    namespace_stem = sanitize_stem(request->target_name != NULL ? request->target_name : "default");
+    for (i = 0; i < request->source_paths.len; ++i) {
+        const SourceFile *source = project_find_source(project, request->source_paths.items[i]);
         BuildUnit *unit;
         char *stem;
         char *unique;
 
-        if (!include_source_for_target(project, i)) {
-            continue;
+        if (source == NULL) {
+            free(namespace_stem);
+            string_list_free(&used);
+            diag_set(diag, "target source `%s` was not found during build planning", request->source_paths.items[i]);
+            return false;
         }
 
         unit = build_unit_list_push(units);
-        unit->source = &project->sources.items[i];
-        stem = sanitize_stem(unit->source->path);
+        unit->source = source;
+        stem = sanitize_stem(source->path);
         unique = mazen_xstrdup(stem);
         if (string_list_contains(&used, unique)) {
-            uint64_t hash = fnv1a_hash_string(unit->source->path, UINT64_C(1469598103934665603));
+            uint64_t hash = fnv1a_hash_string(source->path, UINT64_C(1469598103934665603));
             free(unique);
             unique = mazen_format("%s_%08llx", stem, (unsigned long long) (hash & 0xffffffffu));
         }
         string_list_push_unique(&used, unique);
-        unit->object_rel = mazen_format("build/obj/%s.o", unique);
-        unit->dep_rel = mazen_format("build/obj/%s.d", unique);
+        unit->object_rel = mazen_format("build/obj/%s/%s.o", namespace_stem, unique);
+        unit->dep_rel = mazen_format("build/obj/%s/%s.d", namespace_stem, unique);
         free(unique);
         free(stem);
     }
 
+    free(namespace_stem);
     string_list_free(&used);
+    return true;
 }
 
 static bool prepare_paths(const ProjectInfo *project, const BuildRequest *request, BuildUnitList *units,
-                          char **binary_rel, char **binary_abs, Diagnostic *diag) {
-    size_t i;
-    char *obj_dir = path_join(project->root_dir, "build/obj");
+                          char **output_rel, char **output_abs, char **cache_rel, char **cache_abs,
+                          char **compdb_rel, char **compdb_abs, Diagnostic *diag) {
+    char *cache_name = sanitize_stem(request->target_name != NULL ? request->target_name : "default");
     char *cache_dir = path_join(project->root_dir, "build/.mazen");
+    size_t i;
 
-    if (ensure_directory(obj_dir) != 0 || ensure_directory(cache_dir) != 0) {
-        diag_set(diag, "failed to create build directories");
-        free(obj_dir);
+    if (ensure_directory(cache_dir) != 0) {
+        diag_set(diag, "failed to create build cache directory");
+        free(cache_name);
         free(cache_dir);
         return false;
     }
+    free(cache_dir);
 
     for (i = 0; i < units->len; ++i) {
+        char *object_dir = path_dirname(units->items[i].object_rel);
+        char *object_dir_abs = path_join(project->root_dir, object_dir);
+        int rc = ensure_directory(object_dir_abs);
+
+        free(object_dir);
+        free(object_dir_abs);
+        if (rc != 0) {
+            diag_set(diag, "failed to create object directory");
+            free(cache_name);
+            return false;
+        }
+
+        units->items[i].source_abs = path_join(project->root_dir, units->items[i].source->path);
         units->items[i].object_abs = path_join(project->root_dir, units->items[i].object_rel);
         units->items[i].dep_abs = path_join(project->root_dir, units->items[i].dep_rel);
     }
 
-    *binary_rel = mazen_format("build/%s", request->binary_name);
-    *binary_abs = path_join(project->root_dir, *binary_rel);
-    free(obj_dir);
-    free(cache_dir);
+    if (!ensure_parent_directory(project->root_dir, request->output_path, diag)) {
+        free(cache_name);
+        return false;
+    }
+
+    *output_rel = mazen_xstrdup(request->output_path);
+    *output_abs = resolve_path(project->root_dir, request->output_path);
+    *cache_rel = mazen_format("build/.mazen/%s.state.txt", cache_name);
+    *cache_abs = path_join(project->root_dir, *cache_rel);
+
+    if (request->compile_commands_path != NULL) {
+        if (!ensure_parent_directory(project->root_dir, request->compile_commands_path, diag)) {
+            free(cache_name);
+            return false;
+        }
+        *compdb_rel = mazen_xstrdup(request->compile_commands_path);
+        *compdb_abs = resolve_path(project->root_dir, request->compile_commands_path);
+    }
+
+    free(cache_name);
     return true;
 }
 
-static long long dep_mtime(const ProjectInfo *project, const char *dep) {
-    if (dep[0] == '/') {
+static long long dep_mtime(const char *root_dir, const char *dep) {
+    if (path_is_absolute(dep)) {
         return file_mtime_ns(dep);
     }
+
     {
-        char *absolute = path_join(project->root_dir, dep);
+        char *absolute = path_join(root_dir, dep);
         long long mtime = file_mtime_ns(absolute);
         free(absolute);
         return mtime;
@@ -508,13 +715,13 @@ static bool object_is_stale(const ProjectInfo *project, const BuildUnit *unit, b
         return true;
     }
 
-    source_time = dep_mtime(project, unit->source->path);
+    source_time = dep_mtime(project->root_dir, unit->source->path);
     if (source_time < 0 || source_time > object_time) {
         return true;
     }
 
     for (i = 0; i < unit->deps.len; ++i) {
-        long long mtime = dep_mtime(project, unit->deps.items[i]);
+        long long mtime = dep_mtime(project->root_dir, unit->deps.items[i]);
         if (mtime < 0 || mtime > object_time) {
             return true;
         }
@@ -523,9 +730,9 @@ static bool object_is_stale(const ProjectInfo *project, const BuildUnit *unit, b
     return false;
 }
 
-static void add_common_compile_flags(StringList *args, const BuildRequest *request, const ProjectInfo *project,
-                                     const BuildUnit *unit) {
+static void add_compile_args(StringList *args, const BuildRequest *request, const BuildUnit *unit) {
     size_t i;
+
     string_list_push(args, request->compiler);
     string_list_push_take(args, mazen_standard_flag(request->standard));
     string_list_push(args, "-Wall");
@@ -536,12 +743,13 @@ static void add_common_compile_flags(StringList *args, const BuildRequest *reque
         string_list_push(args, "-g");
         string_list_push(args, "-O0");
     }
-    for (i = 0; i < request->cflags.len; ++i) {
-        string_list_push(args, request->cflags.items[i]);
+    if (request->target_type == MAZEN_TARGET_SHARED_LIBRARY) {
+        string_list_push(args, "-fPIC");
     }
-    for (i = 0; i < project->include_dirs.len; ++i) {
+    build_request_copy_list(args, &request->cflags, false);
+    for (i = 0; i < request->include_dirs.len; ++i) {
         string_list_push(args, "-I");
-        string_list_push(args, project->include_dirs.items[i]);
+        string_list_push(args, request->include_dirs.items[i]);
     }
     string_list_push(args, "-MMD");
     string_list_push(args, "-MF");
@@ -566,37 +774,23 @@ static const char *linker_hint(const char *output) {
     return NULL;
 }
 
-static bool compile_unit(const ProjectInfo *project, const BuildRequest *request, BuildUnit *unit, Diagnostic *diag) {
-    StringList args;
-    String output;
-    int exit_code = 0;
+static void add_link_args(StringList *args, const BuildRequest *request, const BuildUnitList *units,
+                          const char *output_rel, const StringList *libs) {
+    size_t i;
 
-    string_list_init(&args);
-    string_init(&output);
-    add_common_compile_flags(&args, request, project, unit);
-
-    if (request->verbose) {
-        char *command = format_command(&args);
-        diag_note("%s", command);
-        free(command);
+    string_list_push(args, request->compiler);
+    if (request->target_type == MAZEN_TARGET_SHARED_LIBRARY) {
+        string_list_push(args, "-shared");
     }
-    diag_info("Compiling %s", unit->source->path);
-
-    if (!run_command_capture(project->root_dir, &args, true, &exit_code, &output, diag)) {
-        string_list_free(&args);
-        string_free(&output);
-        return false;
+    for (i = 0; i < units->len; ++i) {
+        string_list_push(args, units->items[i].object_rel);
     }
-    if (exit_code != 0) {
-        diag_set(diag, "compilation failed for `%s`", unit->source->path);
-        string_list_free(&args);
-        string_free(&output);
-        return false;
+    string_list_push(args, "-o");
+    string_list_push(args, output_rel);
+    build_request_copy_list(args, &request->ldflags, false);
+    for (i = 0; i < libs->len; ++i) {
+        string_list_push_take(args, mazen_format("-l%s", libs->items[i]));
     }
-
-    string_list_free(&args);
-    string_free(&output);
-    return true;
 }
 
 static bool refresh_unit_dependencies(BuildUnit *unit, Diagnostic *diag) {
@@ -608,56 +802,6 @@ static bool refresh_unit_dependencies(BuildUnit *unit, Diagnostic *diag) {
     return true;
 }
 
-static bool link_target(const ProjectInfo *project, const BuildRequest *request, const BuildUnitList *units,
-                        const char *binary_rel, Diagnostic *diag) {
-    StringList args;
-    String output;
-    size_t i;
-    int exit_code = 0;
-
-    string_list_init(&args);
-    string_init(&output);
-    string_list_push(&args, request->compiler);
-    for (i = 0; i < units->len; ++i) {
-        string_list_push(&args, units->items[i].object_rel);
-    }
-    string_list_push(&args, "-o");
-    string_list_push(&args, binary_rel);
-    for (i = 0; i < request->ldflags.len; ++i) {
-        string_list_push(&args, request->ldflags.items[i]);
-    }
-    for (i = 0; i < request->libs.len; ++i) {
-        string_list_push_take(&args, mazen_format("-l%s", request->libs.items[i]));
-    }
-
-    if (request->verbose) {
-        char *command = format_command(&args);
-        diag_note("%s", command);
-        free(command);
-    }
-
-    diag_info("Linking %s", binary_rel);
-    if (!run_command_capture(project->root_dir, &args, true, &exit_code, &output, diag)) {
-        string_list_free(&args);
-        string_free(&output);
-        return false;
-    }
-    if (exit_code != 0) {
-        const char *hint = linker_hint(output.data == NULL ? "" : output.data);
-        diag_set(diag, "linker failed while producing `%s`", binary_rel);
-        if (hint != NULL) {
-            diag_set_hint(diag, "%s", hint);
-        }
-        string_list_free(&args);
-        string_free(&output);
-        return false;
-    }
-
-    string_list_free(&args);
-    string_free(&output);
-    return true;
-}
-
 static void cache_update_record(const ProjectInfo *project, CacheState *state, const BuildUnit *unit) {
     BuildRecord *record = cache_upsert_record(state, unit->source->path);
     size_t i;
@@ -666,7 +810,7 @@ static void cache_update_record(const ProjectInfo *project, CacheState *state, c
     free(record->dep_path);
     record->object_path = mazen_xstrdup(unit->object_rel);
     record->dep_path = mazen_xstrdup(unit->dep_rel);
-    record->source_mtime_ns = dep_mtime(project, unit->source->path);
+    record->source_mtime_ns = dep_mtime(project->root_dir, unit->source->path);
     record->object_mtime_ns = file_mtime_ns(unit->object_abs);
     string_list_clear(&record->deps);
     for (i = 0; i < unit->deps.len; ++i) {
@@ -676,6 +820,7 @@ static void cache_update_record(const ProjectInfo *project, CacheState *state, c
 
 static bool load_cached_dependencies(const CacheState *state, BuildUnit *unit) {
     size_t i;
+
     for (i = 0; i < state->records.len; ++i) {
         const BuildRecord *record = &state->records.items[i];
         if (record->source_path != NULL && strcmp(record->source_path, unit->source->path) == 0) {
@@ -689,29 +834,326 @@ static bool load_cached_dependencies(const CacheState *state, BuildUnit *unit) {
     return false;
 }
 
-static bool binary_is_stale(const BuildUnitList *units, const char *binary_abs, bool link_flags_changed) {
-    long long binary_time = file_mtime_ns(binary_abs);
+static bool output_is_stale(const BuildUnitList *units, const char *output_abs, bool link_flags_changed) {
+    long long output_time = file_mtime_ns(output_abs);
     size_t i;
 
-    if (link_flags_changed || binary_time < 0) {
+    if (link_flags_changed || output_time < 0) {
         return true;
     }
     for (i = 0; i < units->len; ++i) {
-        if (file_mtime_ns(units->items[i].object_abs) > binary_time) {
+        if (file_mtime_ns(units->items[i].object_abs) > output_time) {
             return true;
         }
     }
     return false;
 }
 
-static bool run_built_program(const ProjectInfo *project, const BuildRequest *request, const char *binary_rel,
+static void add_compdb_entry(CompDbEntryList *list, const ProjectInfo *project, const BuildUnit *unit,
+                             const StringList *args) {
+    CompDbEntry *entry = compdb_entry_list_push(list);
+
+    entry->directory = mazen_xstrdup(project->root_dir);
+    entry->file = mazen_xstrdup(unit->source_abs);
+    entry->command = format_command(args);
+    entry->output = mazen_xstrdup(unit->object_abs);
+}
+
+static ssize_t find_running_slot(const RunningCompile *running, size_t count, pid_t pid) {
+    size_t i;
+
+    for (i = 0; i < count; ++i) {
+        if (running[i].pid == pid) {
+            return (ssize_t) i;
+        }
+    }
+    return -1;
+}
+
+static ssize_t find_free_slot(const RunningCompile *running, size_t count) {
+    size_t i;
+
+    for (i = 0; i < count; ++i) {
+        if (running[i].pid == 0) {
+            return (ssize_t) i;
+        }
+    }
+    return -1;
+}
+
+static void clear_running_slot(RunningCompile *slot) {
+    slot->pid = 0;
+    if (slot->task != NULL) {
+        compile_task_free(slot->task);
+        slot->task = NULL;
+    }
+}
+
+static bool wait_for_compile(const ProjectInfo *project, RunningCompile *running, size_t slot_count, size_t *active_count,
+                             bool *failed, Diagnostic *diag) {
+    int status;
+    pid_t pid;
+    ssize_t slot_index;
+    RunningCompile *slot;
+
+    for (;;) {
+        pid = waitpid(-1, &status, 0);
+        if (pid >= 0) {
+            break;
+        }
+        if (errno != EINTR) {
+            diag_set(diag, "failed waiting for compiler process: %s", strerror(errno));
+            return false;
+        }
+    }
+
+    slot_index = find_running_slot(running, slot_count, pid);
+    if (slot_index < 0) {
+        diag_set(diag, "internal error: unknown compiler process finished");
+        return false;
+    }
+
+    slot = &running[slot_index];
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        if (!refresh_unit_dependencies(slot->task->unit, diag)) {
+            return false;
+        }
+    } else {
+        if (!*failed) {
+            diag_set(diag, "compilation failed for `%s`", slot->task->unit->source->path);
+        }
+        *failed = true;
+    }
+
+    clear_running_slot(slot);
+    --(*active_count);
+    (void) project;
+    return true;
+}
+
+static bool compile_units(const ProjectInfo *project, const BuildRequest *request, BuildUnitList *units,
+                          CacheState *state, bool compile_flags_changed, CompDbEntryList *compdb, bool *any_compiled,
+                          Diagnostic *diag) {
+    CompileTaskList tasks;
+    size_t i;
+    int jobs = effective_job_count(request);
+    RunningCompile *running;
+    size_t active_count = 0;
+    size_t next_task = 0;
+    bool failed = false;
+
+    compile_task_list_init(&tasks);
+    *any_compiled = false;
+
+    for (i = 0; i < units->len; ++i) {
+        BuildUnit *unit = &units->items[i];
+        StringList args;
+        bool stale;
+
+        if (!load_cached_dependencies(state, unit) && file_exists(unit->dep_abs)) {
+            cache_parse_depfile(unit->dep_abs, &unit->deps);
+        }
+
+        string_list_init(&args);
+        add_compile_args(&args, request, unit);
+        add_compdb_entry(compdb, project, unit, &args);
+
+        stale = object_is_stale(project, unit, compile_flags_changed);
+        if (stale) {
+            CompileTask *task = compile_task_list_push(&tasks);
+            task->unit = unit;
+            task->args = args;
+        } else {
+            diag_note("Up to date: %s", unit->source->path);
+            string_list_free(&args);
+        }
+    }
+
+    if (tasks.len == 0) {
+        for (i = 0; i < units->len; ++i) {
+            cache_update_record(project, state, &units->items[i]);
+        }
+        compile_task_list_free(&tasks);
+        return true;
+    }
+
+    running = mazen_xcalloc((size_t) jobs, sizeof(*running));
+    while (next_task < tasks.len || active_count > 0) {
+        while (!failed && next_task < tasks.len && active_count < (size_t) jobs) {
+            ssize_t slot_index;
+            CompileTask *task = &tasks.items[next_task++];
+            char *command;
+
+            slot_index = find_free_slot(running, (size_t) jobs);
+            if (slot_index < 0) {
+                break;
+            }
+
+            if (request->verbose) {
+                command = format_command(&task->args);
+                diag_note("%s", command);
+                free(command);
+            }
+            diag_info("Compiling %s", task->unit->source->path);
+            if (!spawn_command(project->root_dir, &task->args, &running[slot_index].pid, diag)) {
+                failed = true;
+                break;
+            }
+            running[slot_index].task = task;
+            ++active_count;
+            *any_compiled = true;
+        }
+
+        if (active_count == 0) {
+            break;
+        }
+        if (!wait_for_compile(project, running, (size_t) jobs, &active_count, &failed, diag)) {
+            failed = true;
+            break;
+        }
+    }
+
+    while (active_count > 0) {
+        bool ignored_failed = failed;
+        if (!wait_for_compile(project, running, (size_t) jobs, &active_count, &ignored_failed, diag) && !failed) {
+            failed = true;
+        }
+    }
+
+    for (i = 0; i < units->len; ++i) {
+        cache_update_record(project, state, &units->items[i]);
+    }
+
+    free(running);
+    compile_task_list_free(&tasks);
+    return !failed;
+}
+
+static bool link_target(const ProjectInfo *project, const BuildRequest *request, const BuildUnitList *units,
+                        const char *output_rel, const StringList *libs, Diagnostic *diag) {
+    StringList args;
+    String output;
+    size_t i;
+    int exit_code = 0;
+
+    string_list_init(&args);
+    string_init(&output);
+
+    if (request->target_type == MAZEN_TARGET_STATIC_LIBRARY) {
+        string_list_push(&args, "ar");
+        string_list_push(&args, "rcs");
+        string_list_push(&args, output_rel);
+        for (i = 0; i < units->len; ++i) {
+            string_list_push(&args, units->items[i].object_rel);
+        }
+        if (request->verbose) {
+            char *command = format_command(&args);
+            diag_note("%s", command);
+            free(command);
+        }
+        diag_info("Archiving %s", output_rel);
+    } else {
+        add_link_args(&args, request, units, output_rel, libs);
+        if (request->verbose) {
+            char *command = format_command(&args);
+            diag_note("%s", command);
+            free(command);
+        }
+        diag_info("Linking %s", output_rel);
+    }
+
+    if (!run_command_capture(project->root_dir, &args, true, &exit_code, &output, diag)) {
+        string_list_free(&args);
+        string_free(&output);
+        return false;
+    }
+    if (exit_code != 0) {
+        if (request->target_type == MAZEN_TARGET_STATIC_LIBRARY) {
+            diag_set(diag, "archive tool failed while producing `%s`", output_rel);
+        } else {
+            StringList retry_libs;
+            bool retried = false;
+            string_list_init(&retry_libs);
+            build_request_copy_list(&retry_libs, libs, true);
+
+            if (autolib_infer_from_linker_output(output.data == NULL ? "" : output.data, &retry_libs) &&
+                retry_libs.len > libs->len) {
+                char *detected = format_item_list(&retry_libs);
+                retried = true;
+                diag_note("Retrying link with inferred libraries: %s", detected);
+                free(detected);
+                string_list_free(&args);
+                string_free(&output);
+                string_list_init(&args);
+                string_init(&output);
+                add_link_args(&args, request, units, output_rel, &retry_libs);
+                if (request->verbose) {
+                    char *command = format_command(&args);
+                    diag_note("%s", command);
+                    free(command);
+                }
+                diag_info("Linking %s", output_rel);
+                if (!run_command_capture(project->root_dir, &args, true, &exit_code, &output, diag)) {
+                    string_list_free(&retry_libs);
+                    string_list_free(&args);
+                    string_free(&output);
+                    return false;
+                }
+                if (exit_code == 0) {
+                    string_list_free(&retry_libs);
+                    string_list_free(&args);
+                    string_free(&output);
+                    return true;
+                }
+            }
+
+            diag_set(diag, "linker failed while producing `%s`", output_rel);
+            {
+                const char *hint = linker_hint(output.data == NULL ? "" : output.data);
+                if (hint != NULL) {
+                    diag_set_hint(diag, "%s", hint);
+                } else if (!retried) {
+                    diag_set_hint(diag, "Add a library with `mazen --lib NAME` or `libs = [\"NAME\"]`");
+                }
+            }
+            string_list_free(&retry_libs);
+        }
+        string_list_free(&args);
+        string_free(&output);
+        return false;
+    }
+
+    string_list_free(&args);
+    string_free(&output);
+    return true;
+}
+
+static bool write_compile_database(const char *path, const CompDbEntryList *compdb, Diagnostic *diag) {
+    if (path == NULL) {
+        return true;
+    }
+    if (!compdb_write(path, compdb, diag)) {
+        return false;
+    }
+    diag_info("Wrote %s", path);
+    return true;
+}
+
+static bool run_built_program(const ProjectInfo *project, const BuildRequest *request, const char *output_rel,
                               Diagnostic *diag) {
     StringList args;
 
+    if (request->target_type != MAZEN_TARGET_EXECUTABLE) {
+        diag_set(diag, "target `%s` is a %s and cannot be run",
+                 request->target_name != NULL ? request->target_name : "(unnamed)",
+                 mazen_target_type_name(request->target_type));
+        return false;
+    }
+
     string_list_init(&args);
-    string_list_push(&args, binary_rel);
+    string_list_push(&args, output_rel);
     build_request_copy_list(&args, &request->run_args, false);
-    diag_info("Running %s", binary_rel);
+    diag_info("Running %s", output_rel);
     fflush(stdout);
     fflush(stderr);
     if (!run_command_passthrough(project->root_dir, &args, diag)) {
@@ -726,64 +1168,115 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
                    Diagnostic *diag) {
     CacheState state;
     BuildUnitList units;
-    char *binary_rel = NULL;
-    char *binary_abs = NULL;
-    char *cache_path = NULL;
+    CompDbEntryList compdb;
+    StringList auto_libs;
+    StringList effective_libs;
+    char *output_rel = NULL;
+    char *output_abs = NULL;
+    char *cache_rel = NULL;
+    char *cache_abs = NULL;
+    char *compdb_rel = NULL;
+    char *compdb_abs = NULL;
     char *compile_sig = NULL;
     char *link_sig = NULL;
     bool compile_flags_changed;
     bool link_flags_changed;
     bool any_compiled = false;
     bool did_link = false;
-    size_t i;
     (void) config;
 
     if (project->sources.len == 0) {
         diag_set(diag, "no C source files were found in `%s`", project->root_dir);
         return false;
     }
-    if (!project->has_selected_entry) {
-        diag_set(diag, "no entrypoint containing `main()` was detected");
+    if (request->source_paths.len == 0) {
+        diag_set(diag, "target `%s` resolved to no source files",
+                 request->target_name != NULL ? request->target_name : "(unnamed)");
+        return false;
+    }
+    if (request->target_type == MAZEN_TARGET_EXECUTABLE && request->entry_path == NULL) {
+        diag_set(diag, "no entrypoint containing `main()` was detected for target `%s`",
+                 request->target_name != NULL ? request->target_name : "(unnamed)");
         diag_set_hint(diag, "Run `mazen doctor` to inspect discovery results");
+        return false;
+    }
+    if (request->run_after_build && request->target_type != MAZEN_TARGET_EXECUTABLE) {
+        diag_set(diag, "target `%s` is a %s and cannot be run",
+                 request->target_name != NULL ? request->target_name : "(unnamed)",
+                 mazen_target_type_name(request->target_type));
         return false;
     }
 
     diag_info("Scanning project...");
     diag_info("Found %zu source files", project->sources.len);
-    if (project->multiple_entrypoints) {
-        puts("Multiple entrypoints detected:");
-        for (i = 0; i < project->sources.len; ++i) {
-            if (project->sources.items[i].has_main) {
-                printf("    %s\n", project->sources.items[i].path);
-            }
-        }
-        printf("Selected: %s\n", project->sources.items[project->selected_entry].path);
-    } else {
-        diag_info("Detected entrypoint: %s", project->sources.items[project->selected_entry].path);
+    diag_info("Resolved target: %s (%s)", request->target_name != NULL ? request->target_name : project->project_name,
+              mazen_target_type_name(request->target_type));
+    if (request->entry_path != NULL) {
+        diag_info("Detected entrypoint: %s", request->entry_path);
     }
-    print_include_dirs(project);
+    print_include_dirs(request);
     diag_info("Building %s target", request->mode == MAZEN_BUILD_RELEASE ? "release" : "debug");
+    if (effective_job_count(request) > 1) {
+        diag_note("Using %d parallel jobs", effective_job_count(request));
+    }
 
     build_unit_list_init(&units);
     cache_state_init(&state);
-    create_build_units(project, &units);
-    if (!prepare_paths(project, request, &units, &binary_rel, &binary_abs, diag)) {
+    compdb_entry_list_init(&compdb);
+    string_list_init(&auto_libs);
+    string_list_init(&effective_libs);
+
+    build_request_copy_list(&effective_libs, &request->libs, true);
+    if (request->target_type != MAZEN_TARGET_STATIC_LIBRARY) {
+        autolib_infer(project->root_dir, &request->source_paths, &auto_libs);
+        build_request_copy_list(&effective_libs, &auto_libs, true);
+        if (auto_libs.len > 0) {
+            char *detected = format_item_list(&auto_libs);
+            diag_note("Auto-detected libraries: %s", detected);
+            free(detected);
+        }
+    }
+
+    if (!create_build_units(project, request, &units, diag)) {
+        string_list_free(&auto_libs);
+        string_list_free(&effective_libs);
         build_unit_list_free(&units);
         cache_state_free(&state);
+        compdb_entry_list_free(&compdb);
+        return false;
+    }
+    if (!prepare_paths(project, request, &units, &output_rel, &output_abs, &cache_rel, &cache_abs, &compdb_rel,
+                       &compdb_abs, diag)) {
+        free(output_rel);
+        free(output_abs);
+        free(cache_rel);
+        free(cache_abs);
+        free(compdb_rel);
+        free(compdb_abs);
+        string_list_free(&auto_libs);
+        string_list_free(&effective_libs);
+        build_unit_list_free(&units);
+        cache_state_free(&state);
+        compdb_entry_list_free(&compdb);
         return false;
     }
 
-    cache_path = path_join(project->root_dir, "build/.mazen/state.txt");
-    if (!cache_load(cache_path, &state, diag)) {
-        free(binary_rel);
-        free(binary_abs);
-        free(cache_path);
+    if (!cache_load(cache_abs, &state, diag)) {
+        free(output_rel);
+        free(output_abs);
+        free(cache_rel);
+        free(cache_abs);
+        free(compdb_rel);
+        free(compdb_abs);
+        string_list_free(&auto_libs);
+        string_list_free(&effective_libs);
         build_unit_list_free(&units);
         cache_state_free(&state);
+        compdb_entry_list_free(&compdb);
         return false;
     }
 
-    make_signatures(project, request, &compile_sig, &link_sig);
+    make_signatures(request, &effective_libs, &compile_sig, &link_sig);
     compile_flags_changed = state.compile_signature == NULL || strcmp(state.compile_signature, compile_sig) != 0;
     link_flags_changed = state.link_signature == NULL || strcmp(state.link_signature, link_sig) != 0;
     free(state.compile_signature);
@@ -795,88 +1288,112 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
         diag_note("Compiler flags changed, invalidating object cache");
     }
 
-    for (i = 0; i < units.len; ++i) {
-        BuildUnit *unit = &units.items[i];
-        if (!load_cached_dependencies(&state, unit) && file_exists(unit->dep_abs)) {
-            cache_parse_depfile(unit->dep_abs, &unit->deps);
-        }
-
-        if (object_is_stale(project, unit, compile_flags_changed)) {
-            if (!compile_unit(project, request, unit, diag)) {
-                free(binary_rel);
-                free(binary_abs);
-                free(cache_path);
-                free(compile_sig);
-                free(link_sig);
-                build_unit_list_free(&units);
-                cache_state_free(&state);
-                return false;
-            }
-            if (!refresh_unit_dependencies(unit, diag)) {
-                free(binary_rel);
-                free(binary_abs);
-                free(cache_path);
-                free(compile_sig);
-                free(link_sig);
-                build_unit_list_free(&units);
-                cache_state_free(&state);
-                return false;
-            }
-            any_compiled = true;
-        } else {
-            diag_note("Up to date: %s", unit->source->path);
-        }
-        cache_update_record(project, &state, unit);
+    if (!compile_units(project, request, &units, &state, compile_flags_changed, &compdb, &any_compiled, diag)) {
+        free(output_rel);
+        free(output_abs);
+        free(cache_rel);
+        free(cache_abs);
+        free(compdb_rel);
+        free(compdb_abs);
+        free(compile_sig);
+        free(link_sig);
+        string_list_free(&auto_libs);
+        string_list_free(&effective_libs);
+        build_unit_list_free(&units);
+        cache_state_free(&state);
+        compdb_entry_list_free(&compdb);
+        return false;
     }
 
-    if (binary_is_stale(&units, binary_abs, link_flags_changed || any_compiled)) {
-        if (!link_target(project, request, &units, binary_rel, diag)) {
-            free(binary_rel);
-            free(binary_abs);
-            free(cache_path);
+    if (output_is_stale(&units, output_abs, link_flags_changed || any_compiled)) {
+        if (!link_target(project, request, &units, output_rel, &effective_libs, diag)) {
+            free(output_rel);
+            free(output_abs);
+            free(cache_rel);
+            free(cache_abs);
+            free(compdb_rel);
+            free(compdb_abs);
             free(compile_sig);
             free(link_sig);
+            string_list_free(&auto_libs);
+            string_list_free(&effective_libs);
             build_unit_list_free(&units);
             cache_state_free(&state);
+            compdb_entry_list_free(&compdb);
             return false;
         }
         did_link = true;
     } else {
-        diag_note("Executable is up to date");
+        diag_note("Up to date: %s", output_rel);
     }
 
-    if (!cache_save(cache_path, &state, diag)) {
-        free(binary_rel);
-        free(binary_abs);
-        free(cache_path);
+    if (!cache_save(cache_abs, &state, diag)) {
+        free(output_rel);
+        free(output_abs);
+        free(cache_rel);
+        free(cache_abs);
+        free(compdb_rel);
+        free(compdb_abs);
         free(compile_sig);
         free(link_sig);
+        string_list_free(&auto_libs);
+        string_list_free(&effective_libs);
         build_unit_list_free(&units);
         cache_state_free(&state);
+        compdb_entry_list_free(&compdb);
         return false;
     }
 
-    if (!any_compiled && !did_link) {
-        diag_info("Nothing to rebuild");
-    }
-
-    if (request->run_after_build && !run_built_program(project, request, binary_rel, diag)) {
-        free(binary_rel);
-        free(binary_abs);
-        free(cache_path);
+    if (!write_compile_database(compdb_abs, &compdb, diag)) {
+        free(output_rel);
+        free(output_abs);
+        free(cache_rel);
+        free(cache_abs);
+        free(compdb_rel);
+        free(compdb_abs);
         free(compile_sig);
         free(link_sig);
+        string_list_free(&auto_libs);
+        string_list_free(&effective_libs);
         build_unit_list_free(&units);
         cache_state_free(&state);
+        compdb_entry_list_free(&compdb);
         return false;
     }
 
-    free(binary_rel);
-    free(binary_abs);
-    free(cache_path);
+    if (!did_link && !any_compiled) {
+        diag_info("Target is up to date");
+    }
+
+    if (request->run_after_build && !run_built_program(project, request, output_rel, diag)) {
+        free(output_rel);
+        free(output_abs);
+        free(cache_rel);
+        free(cache_abs);
+        free(compdb_rel);
+        free(compdb_abs);
+        free(compile_sig);
+        free(link_sig);
+        string_list_free(&auto_libs);
+        string_list_free(&effective_libs);
+        build_unit_list_free(&units);
+        cache_state_free(&state);
+        compdb_entry_list_free(&compdb);
+        return false;
+    }
+
+    free(output_rel);
+    free(output_abs);
+    free(cache_rel);
+    free(cache_abs);
+    free(compdb_rel);
+    free(compdb_abs);
     free(compile_sig);
     free(link_sig);
+    string_list_free(&auto_libs);
+    string_list_free(&effective_libs);
     build_unit_list_free(&units);
     cache_state_free(&state);
+    compdb_entry_list_free(&compdb);
     return true;
 }

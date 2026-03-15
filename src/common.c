@@ -149,6 +149,9 @@ void string_appendf(String *string, const char *fmt, ...) {
 
 char *string_take(String *string) {
     char *data = string->data;
+    if (data == NULL) {
+        data = mazen_xstrdup("");
+    }
     string->data = NULL;
     string->len = 0;
     string->cap = 0;

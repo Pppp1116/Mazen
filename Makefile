@@ -5,16 +5,19 @@ LDFLAGS ?=
 
 SRC := \
 	src/main.c \
+	src/autolib.c \
 	src/build.c \
 	src/cache.c \
 	src/classifier.c \
 	src/cli.c \
+	src/compdb.c \
 	src/common.c \
 	src/config.c \
 	src/diag.c \
 	src/doctor.c \
 	src/scanner.c \
-	src/standard.c
+	src/standard.c \
+	src/target.c
 
 OBJ := $(SRC:.c=.o)
 

@@ -20,12 +20,16 @@ incremental rebuilds, and low friction for messy real-world trees.
 ## Features
 
 - Zero-config project discovery for C source trees
+- Explicit multi-target builds with named executables and libraries
 - Recursive scanning with sensible ignored directories
 - Entry-point inference with `main()` detection and target scoring
 - Automatic include directory inference from headers and `#include` usage
 - Clang-based incremental compilation with `.d` dependency files
+- Parallel compilation with `-j` and `--jobs`
+- `compile_commands.json` generation for editor and LSP tooling
+- Automatic inference for common system libraries like `m`, `pthread`, `dl`, and `rt`
 - Build cache stored in `build/.mazen/`
-- Optional `mazen.toml` overrides
+- Richer `mazen.toml` overrides with target sections
 - Helpful commands for diagnostics and cleanup
 
 ## Project Layout
@@ -37,6 +41,8 @@ Mazen/
 ├── include/
 │   └── mazen.h
 ├── src/
+│   ├── autolib.c
+│   ├── autolib.h
 │   ├── build.c
 │   ├── build.h
 │   ├── cache.c
@@ -45,6 +51,8 @@ Mazen/
 │   ├── classifier.h
 │   ├── cli.c
 │   ├── cli.h
+│   ├── compdb.c
+│   ├── compdb.h
 │   ├── common.c
 │   ├── common.h
 │   ├── config.c
@@ -57,7 +65,9 @@ Mazen/
 │   ├── scanner.c
 │   ├── scanner.h
 │   ├── standard.c
-│   └── standard.h
+│   ├── standard.h
+│   ├── target.c
+│   └── target.h
 └── examples/
     ├── messy/
     ├── organized/
@@ -127,7 +137,8 @@ and the selected entrypoint.
 mazen list
 ```
 
-List detected entry targets.
+List configured targets from `mazen.toml`, or detected entry targets when no
+explicit targets are defined.
 
 ```sh
 mazen standards
@@ -165,6 +176,27 @@ Examples:
 ```sh
 mazen --std c99
 mazen run --std gnu11
+```
+
+## Target Selection
+
+MAZEN still works in zero-config mode, but it can also build explicit named
+targets from `mazen.toml`.
+
+Examples:
+
+```sh
+mazen
+mazen --target app
+mazen run --target app
+mazen --target corelib
+```
+
+Parallel job control:
+
+```sh
+mazen -j 8
+mazen release --jobs 4
 ```
 
 ## Default Compiler Flags
@@ -298,20 +330,21 @@ The inferred include roots are then passed to Clang with `-I`.
 Each source compiles to an object file in:
 
 ```text
-build/obj/
+build/obj/<target>/
 ```
 
 Examples:
 
 ```text
-build/obj/main.o
-build/obj/core_math.o
+build/obj/app/main.o
+build/obj/app/core_math.o
 ```
 
 MAZEN also stores:
 
 - dependency files next to object files
-- cache metadata in `build/.mazen/state.txt`
+- target-specific cache metadata in `build/.mazen/*.state.txt`
+- compile database output at `compile_commands.json` by default
 
 The cache tracks:
 
@@ -338,6 +371,9 @@ Example:
 ```toml
 name = "myapp"
 c_standard = "c23"
+jobs = 6
+compile_commands_path = "build/compile_commands.json"
+default_target = "app"
 
 include_dirs = ["vendor/include"]
 libs = ["m", "pthread"]
@@ -345,24 +381,64 @@ exclude = ["examples", "tests"]
 src_dirs = ["src", "core"]
 cflags = ["-DDEBUG_LOGGING=1"]
 ldflags = ["-Wl,--as-needed"]
+
+[target.app]
+type = "executable"
+entry = "src/main.c"
+sources = ["src/main.c", "src/app.c", "core/math.c"]
+output = "build/myapp"
+
+[target.math]
+type = "static"
+sources = ["core/math.c"]
+output = "build/libmath.a"
+
+[target.plugin]
+type = "shared"
+sources = ["plugins/filter.c", "plugins/common.c"]
+output = "build/libplugin.so"
+cflags = ["-DPLUGIN_BUILD=1"]
+include_dirs = ["plugins/include"]
+exclude = ["plugins/old"]
 ```
 
 Supported keys:
 
 - `name`
 - `c_standard`
+- `jobs`
+- `compile_commands_path`
+- `default_target`
 - `include_dirs`
 - `libs`
 - `exclude`
 - `src_dirs`
+- `sources`
 - `cflags`
 - `ldflags`
+
+Supported target-section keys:
+
+- `[target.NAME]`
+- `type = "executable" | "static" | "shared"`
+- `default = true`
+- `entry`
+- `output`
+- `src_dirs`
+- `sources`
+- `include_dirs`
+- `libs`
+- `cflags`
+- `ldflags`
+- `exclude`
 
 Command-line options can extend or override config values:
 
 ```sh
 mazen --name custom-app
 mazen --std gnu17
+mazen --target app
+mazen -j 8
 mazen --lib m
 mazen -I vendor/include
 mazen --src-dir core
@@ -370,7 +446,36 @@ mazen --exclude examples
 ```
 
 The `doctor` command reports the active toolchain selection, including the
-compiler and resolved C standard.
+compiler, resolved C standard, selected target, job count, and compile database
+path.
+
+## Explicit Targets And Libraries
+
+When `mazen.toml` defines `[target.NAME]` sections, MAZEN resolves one target at
+a time:
+
+- executable targets produce binaries such as `build/app`
+- static library targets produce archives such as `build/libcore.a`
+- shared library targets produce shared objects such as `build/libcore.so`
+
+If multiple explicit targets exist, MAZEN uses this precedence:
+
+1. CLI `--target NAME`
+2. config `default_target = "NAME"`
+3. a single `default = true` target
+4. the only configured target, if exactly one exists
+
+Otherwise MAZEN asks you to pick a target explicitly.
+
+Every build also refreshes a compile database for the active target. By
+default this is `compile_commands.json` in the project root, or the path set by
+`compile_commands_path`.
+
+MAZEN also tries to infer a few common system libraries automatically from
+source usage, so projects using headers or symbols like `math.h`, `sqrt`,
+`pthread_create`, `dlopen`, or `clock_gettime` usually work without a manual
+`--lib` flag. Explicit `libs = [...]` and `--lib NAME` values still take
+precedence when you want to pin or extend the link set.
 
 ## Typical Output
 

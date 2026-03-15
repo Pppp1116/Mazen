@@ -7,9 +7,12 @@
 typedef struct {
     MazenCommand command;
     bool verbose;
+    int jobs;
+    bool jobs_set;
     char *compiler;
     char *c_standard;
     char *name_override;
+    char *target_name;
     StringList include_dirs;
     StringList libs;
     StringList src_dirs;

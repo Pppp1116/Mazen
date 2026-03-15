@@ -7,6 +7,7 @@
 #include "config.h"
 #include "diag.h"
 #include "standard.h"
+#include "target.h"
 
 typedef struct {
     const char *compiler;
@@ -14,7 +15,14 @@ typedef struct {
     MazenBuildMode mode;
     bool run_after_build;
     bool verbose;
-    char *binary_name;
+    int jobs;
+    char *target_name;
+    MazenTargetType target_type;
+    char *output_path;
+    char *entry_path;
+    char *compile_commands_path;
+    StringList source_paths;
+    StringList include_dirs;
     StringList libs;
     StringList cflags;
     StringList ldflags;
@@ -23,7 +31,7 @@ typedef struct {
 
 void build_request_init(BuildRequest *request);
 void build_request_free(BuildRequest *request);
-bool build_clean(const char *root_dir, Diagnostic *diag);
+bool build_clean(const char *root_dir, const MazenConfig *config, Diagnostic *diag);
 bool build_project(const ProjectInfo *project, const MazenConfig *config, const BuildRequest *request,
                    Diagnostic *diag);
 
