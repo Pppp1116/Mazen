@@ -1,0 +1,10 @@
+#ifndef MAZEN_H
+#define MAZEN_H
+
+#define MAZEN_VERSION_MAJOR 0
+#define MAZEN_VERSION_MINOR 1
+#define MAZEN_VERSION_PATCH 0
+
+#define MAZEN_VERSION_STRING "0.1.0"
+
+#endif
