@@ -17,8 +17,13 @@ typedef struct {
     MazenTargetType type;
     bool type_set;
     bool default_target;
+    bool test_target;
+    bool test_set;
+    bool install_target;
+    bool install_set;
     char *entry;
     char *output;
+    char *install_dir;
     StringList src_dirs;
     StringList include_dirs;
     StringList libs;
@@ -26,6 +31,7 @@ typedef struct {
     StringList ldflags;
     StringList sources;
     StringList exclude;
+    StringList deps;
 } MazenTargetConfig;
 
 typedef struct {
@@ -39,13 +45,19 @@ typedef struct {
     MazenTargetType type;
     char *output_path;
     char *entry_path;
+    char *install_dir;
     bool from_config;
     bool is_default;
+    bool is_test;
+    bool install_enabled;
     StringList source_paths;
     StringList include_dirs;
     StringList libs;
     StringList cflags;
     StringList ldflags;
+    StringList dep_names;
+    StringList dependency_outputs;
+    StringList runtime_library_dirs;
 } ResolvedTarget;
 
 typedef struct {
@@ -74,6 +86,10 @@ bool mazen_target_resolve(const ProjectInfo *project, const struct MazenConfig *
                           ResolvedTarget *resolved, Diagnostic *diag);
 bool mazen_target_resolve_all(const ProjectInfo *project, const struct MazenConfig *config, ResolvedTargetList *list,
                               Diagnostic *diag);
+bool mazen_target_plan_build(const ProjectInfo *project, const struct MazenConfig *config, const char *requested_name,
+                             bool all_targets, ResolvedTargetList *list, Diagnostic *diag);
+bool mazen_target_plan_tests(const ProjectInfo *project, const struct MazenConfig *config, const char *requested_name,
+                             const char *filter, ResolvedTargetList *list, Diagnostic *diag);
 void mazen_target_print_list(const ProjectInfo *project, const struct MazenConfig *config);
 
 #endif

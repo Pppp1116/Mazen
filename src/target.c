@@ -65,6 +65,16 @@ static bool path_matches_any_component(const char *path, const char *const *item
     return false;
 }
 
+static bool text_looks_like_test(const char *text) {
+    if (text == NULL || *text == '\0') {
+        return false;
+    }
+    if (path_matches_any_component(text, CONTEXT_TEST_NAMES, MAZEN_ARRAY_LEN(CONTEXT_TEST_NAMES))) {
+        return true;
+    }
+    return strstr(text, "_test") != NULL || strstr(text, "test_") != NULL || strstr(text, "spec") != NULL;
+}
+
 static PathContext source_path_context(const SourceFile *source) {
     if (path_matches_any_component(source->path, CONTEXT_TEST_NAMES, MAZEN_ARRAY_LEN(CONTEXT_TEST_NAMES))) {
         return PATH_CONTEXT_TEST;
@@ -220,8 +230,13 @@ void mazen_target_config_init(MazenTargetConfig *target) {
     target->type = MAZEN_TARGET_EXECUTABLE;
     target->type_set = false;
     target->default_target = false;
+    target->test_target = false;
+    target->test_set = false;
+    target->install_target = false;
+    target->install_set = false;
     target->entry = NULL;
     target->output = NULL;
+    target->install_dir = NULL;
     string_list_init(&target->src_dirs);
     string_list_init(&target->include_dirs);
     string_list_init(&target->libs);
@@ -229,12 +244,14 @@ void mazen_target_config_init(MazenTargetConfig *target) {
     string_list_init(&target->ldflags);
     string_list_init(&target->sources);
     string_list_init(&target->exclude);
+    string_list_init(&target->deps);
 }
 
 void mazen_target_config_free(MazenTargetConfig *target) {
     free(target->name);
     free(target->entry);
     free(target->output);
+    free(target->install_dir);
     string_list_free(&target->src_dirs);
     string_list_free(&target->include_dirs);
     string_list_free(&target->libs);
@@ -242,6 +259,7 @@ void mazen_target_config_free(MazenTargetConfig *target) {
     string_list_free(&target->ldflags);
     string_list_free(&target->sources);
     string_list_free(&target->exclude);
+    string_list_free(&target->deps);
     mazen_target_config_init(target);
 }
 
@@ -336,24 +354,34 @@ void resolved_target_init(ResolvedTarget *target) {
     target->type = MAZEN_TARGET_EXECUTABLE;
     target->output_path = NULL;
     target->entry_path = NULL;
+    target->install_dir = NULL;
     target->from_config = false;
     target->is_default = false;
+    target->is_test = false;
+    target->install_enabled = false;
     string_list_init(&target->source_paths);
     string_list_init(&target->include_dirs);
     string_list_init(&target->libs);
     string_list_init(&target->cflags);
     string_list_init(&target->ldflags);
+    string_list_init(&target->dep_names);
+    string_list_init(&target->dependency_outputs);
+    string_list_init(&target->runtime_library_dirs);
 }
 
 void resolved_target_free(ResolvedTarget *target) {
     free(target->name);
     free(target->output_path);
     free(target->entry_path);
+    free(target->install_dir);
     string_list_free(&target->source_paths);
     string_list_free(&target->include_dirs);
     string_list_free(&target->libs);
     string_list_free(&target->cflags);
     string_list_free(&target->ldflags);
+    string_list_free(&target->dep_names);
+    string_list_free(&target->dependency_outputs);
+    string_list_free(&target->runtime_library_dirs);
     resolved_target_init(target);
 }
 
@@ -457,6 +485,120 @@ static char *legacy_batch_target_basename(const ProjectInfo *project, const stru
     return sanitize_stem(source->path);
 }
 
+static const ResolvedTarget *resolved_target_list_find_const(const ResolvedTargetList *list, const char *name) {
+    size_t i;
+
+    for (i = 0; i < list->len; ++i) {
+        if (strcmp(list->items[i].name, name) == 0) {
+            return &list->items[i];
+        }
+    }
+    return NULL;
+}
+
+static size_t config_target_index(const struct MazenConfig *config, const char *name) {
+    size_t i;
+
+    for (i = 0; i < config->targets.len; ++i) {
+        if (strcmp(config->targets.items[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return config->targets.len;
+}
+
+static bool source_list_looks_like_test(const ProjectInfo *project, const StringList *paths) {
+    size_t i;
+
+    for (i = 0; i < paths->len; ++i) {
+        const SourceFile *source = project_find_source(project, paths->items[i], NULL);
+
+        if (source != NULL && source->role == SOURCE_ROLE_TEST) {
+            return true;
+        }
+        if (text_looks_like_test(paths->items[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool target_cfg_looks_like_test(const ProjectInfo *project, const MazenTargetConfig *target_cfg) {
+    size_t i;
+
+    if (text_looks_like_test(target_cfg->name) || text_looks_like_test(target_cfg->entry)) {
+        return true;
+    }
+    for (i = 0; i < target_cfg->src_dirs.len; ++i) {
+        if (text_looks_like_test(target_cfg->src_dirs.items[i])) {
+            return true;
+        }
+    }
+    if (source_list_looks_like_test(project, &target_cfg->sources)) {
+        return true;
+    }
+    return false;
+}
+
+static void add_runtime_dir(StringList *dirs, const char *path) {
+    char *dir = path_dirname(path);
+    string_list_push_unique_take(dirs, dir);
+}
+
+static bool finalize_resolved_dependencies(ResolvedTargetList *list, ResolvedTarget *resolved, Diagnostic *diag) {
+    size_t i;
+
+    for (i = 0; i < resolved->dep_names.len; ++i) {
+        const ResolvedTarget *dependency = resolved_target_list_find_const(list, resolved->dep_names.items[i]);
+        size_t j;
+
+        if (dependency == NULL) {
+            diag_set(diag, "internal error: dependency `%s` was not resolved before `%s`", resolved->dep_names.items[i],
+                     resolved->name);
+            return false;
+        }
+        if (dependency->type == MAZEN_TARGET_EXECUTABLE) {
+            diag_set(diag, "target `%s` cannot depend on executable target `%s`", resolved->name, dependency->name);
+            return false;
+        }
+
+        for (j = 0; j < dependency->include_dirs.len; ++j) {
+            string_list_push_unique(&resolved->include_dirs, dependency->include_dirs.items[j]);
+        }
+        for (j = 0; j < dependency->libs.len; ++j) {
+            string_list_push_unique(&resolved->libs, dependency->libs.items[j]);
+        }
+
+        string_list_push_unique(&resolved->dependency_outputs, dependency->output_path);
+        for (j = 0; j < dependency->dependency_outputs.len; ++j) {
+            string_list_push_unique(&resolved->dependency_outputs, dependency->dependency_outputs.items[j]);
+        }
+
+        if (dependency->type == MAZEN_TARGET_SHARED_LIBRARY) {
+            add_runtime_dir(&resolved->runtime_library_dirs, dependency->output_path);
+        }
+        for (j = 0; j < dependency->runtime_library_dirs.len; ++j) {
+            string_list_push_unique(&resolved->runtime_library_dirs, dependency->runtime_library_dirs.items[j]);
+        }
+    }
+
+    return true;
+}
+
+static void mark_default_target(ResolvedTargetList *list, const char *name) {
+    size_t i;
+
+    if (name == NULL) {
+        return;
+    }
+    for (i = 0; i < list->len; ++i) {
+        if (strcmp(list->items[i].name, name) == 0) {
+            list->items[i].is_default = true;
+            return;
+        }
+    }
+}
+
 static const MazenTargetConfig *select_config_target(const struct MazenConfig *config, const char *requested_name,
                                                      bool *is_default, Diagnostic *diag) {
     const MazenTargetConfig *chosen = NULL;
@@ -525,10 +667,14 @@ static bool resolve_config_target(const ProjectInfo *project, const struct Mazen
     resolved->is_default = is_default;
     resolved->name = mazen_xstrdup(target_cfg->name);
     resolved->type = target_cfg->type_set ? target_cfg->type : MAZEN_TARGET_EXECUTABLE;
+    resolved->is_test = target_cfg->test_set ? target_cfg->test_target : target_cfg_looks_like_test(project, target_cfg);
+    resolved->install_enabled = target_cfg->install_set ? target_cfg->install_target : !resolved->is_test;
+    resolved->install_dir = target_cfg->install_dir != NULL ? mazen_xstrdup(target_cfg->install_dir) : NULL;
     string_list_copy_unique(&resolved->include_dirs, &target_cfg->include_dirs);
     string_list_copy_unique(&resolved->libs, &target_cfg->libs);
     string_list_copy_unique(&resolved->cflags, &target_cfg->cflags);
     string_list_copy_unique(&resolved->ldflags, &target_cfg->ldflags);
+    string_list_copy_unique(&resolved->dep_names, &target_cfg->deps);
 
     string_list_init(&excludes);
     string_list_copy_unique(&excludes, &config->exclude);
@@ -660,6 +806,8 @@ bool mazen_target_resolve(const ProjectInfo *project, const struct MazenConfig *
         resolved->is_default = true;
         resolved->name = mazen_xstrdup(config->name != NULL ? config->name : project->project_name);
         resolved->type = MAZEN_TARGET_EXECUTABLE;
+        resolved->is_test = false;
+        resolved->install_enabled = true;
         resolved->output_path = mazen_format("build/%s", config->name != NULL ? config->name : project->project_name);
         if (project->has_selected_entry) {
             entry_index = project->selected_entry;
@@ -717,6 +865,8 @@ bool mazen_target_resolve_all(const ProjectInfo *project, const struct MazenConf
             resolved->from_config = false;
             resolved->is_default = project->has_selected_entry && i == project->selected_entry;
             resolved->type = MAZEN_TARGET_EXECUTABLE;
+            resolved->is_test = source->role == SOURCE_ROLE_TEST;
+            resolved->install_enabled = !resolved->is_test;
             base_name = legacy_batch_target_basename(project, config, source, i, entry_count);
             unique_name = make_unique_target_name(list, base_name);
             free(base_name);
@@ -756,6 +906,263 @@ bool mazen_target_resolve_all(const ProjectInfo *project, const struct MazenConf
     return true;
 }
 
+static bool collect_config_graph_target(const ProjectInfo *project, const struct MazenConfig *config, size_t index,
+                                        unsigned char *states, StringList *stack, ResolvedTargetList *list,
+                                        Diagnostic *diag) {
+    const MazenTargetConfig *target_cfg = &config->targets.items[index];
+    size_t i;
+    ResolvedTarget resolved;
+    ResolvedTarget *slot;
+
+    if (states[index] == 2) {
+        return true;
+    }
+    if (states[index] == 1) {
+        String cycle;
+        size_t j;
+
+        string_init(&cycle);
+        for (j = 0; j < stack->len; ++j) {
+            if (j > 0) {
+                string_append(&cycle, " -> ");
+            }
+            string_append(&cycle, stack->items[j]);
+        }
+        if (stack->len > 0) {
+            string_append(&cycle, " -> ");
+        }
+        string_append(&cycle, target_cfg->name);
+        diag_set(diag, "target dependency cycle detected: %s", cycle.data != NULL ? cycle.data : target_cfg->name);
+        string_free(&cycle);
+        return false;
+    }
+
+    states[index] = 1;
+    string_list_push(stack, target_cfg->name);
+    for (i = 0; i < target_cfg->deps.len; ++i) {
+        size_t dep_index = config_target_index(config, target_cfg->deps.items[i]);
+        if (dep_index == config->targets.len) {
+            diag_set(diag, "target `%s` depends on undefined target `%s`", target_cfg->name, target_cfg->deps.items[i]);
+            states[index] = 0;
+            stack->len -= 1;
+            free(stack->items[stack->len]);
+            stack->items[stack->len] = NULL;
+            return false;
+        }
+        if (!collect_config_graph_target(project, config, dep_index, states, stack, list, diag)) {
+            states[index] = 0;
+            stack->len -= 1;
+            free(stack->items[stack->len]);
+            stack->items[stack->len] = NULL;
+            return false;
+        }
+    }
+
+    resolved_target_init(&resolved);
+    if (!resolve_config_target(project, config, target_cfg, false, &resolved, diag)) {
+        states[index] = 0;
+        stack->len -= 1;
+        free(stack->items[stack->len]);
+        stack->items[stack->len] = NULL;
+        resolved_target_free(&resolved);
+        return false;
+    }
+    if (!finalize_resolved_dependencies(list, &resolved, diag)) {
+        states[index] = 0;
+        stack->len -= 1;
+        free(stack->items[stack->len]);
+        stack->items[stack->len] = NULL;
+        resolved_target_free(&resolved);
+        return false;
+    }
+
+    slot = resolved_target_list_push(list);
+    *slot = resolved;
+    states[index] = 2;
+    stack->len -= 1;
+    free(stack->items[stack->len]);
+    stack->items[stack->len] = NULL;
+    return true;
+}
+
+static bool select_test_root(const ProjectInfo *project, const struct MazenConfig *config, const char *requested_name,
+                             const char *filter, bool *selected, Diagnostic *diag) {
+    size_t i;
+    size_t selected_count = 0;
+
+    (void) project;
+    for (i = 0; i < config->targets.len; ++i) {
+        const MazenTargetConfig *target = &config->targets.items[i];
+        bool is_test = target->test_set ? target->test_target : target_cfg_looks_like_test(project, target);
+        bool matches = true;
+
+        if (!is_test) {
+            selected[i] = false;
+            continue;
+        }
+        if (requested_name != NULL) {
+            matches = strcmp(target->name, requested_name) == 0;
+        } else if (filter != NULL) {
+            matches = strstr(target->name, filter) != NULL ||
+                      (target->entry != NULL && strstr(target->entry, filter) != NULL);
+        }
+
+        selected[i] = matches;
+        if (matches) {
+            ++selected_count;
+        }
+    }
+
+    if (requested_name != NULL && selected_count == 0) {
+        diag_set(diag, "target `%s` is not defined as a test target", requested_name);
+        return false;
+    }
+    if (filter != NULL && selected_count == 0) {
+        diag_set(diag, "no test targets matched `%s`", filter);
+        return false;
+    }
+    if (requested_name == NULL && filter == NULL && selected_count == 0) {
+        diag_set(diag, "no test targets are defined");
+        diag_set_hint(diag, "Mark explicit test targets with `test = true` in mazen.toml");
+        return false;
+    }
+
+    return true;
+}
+
+bool mazen_target_plan_build(const ProjectInfo *project, const struct MazenConfig *config, const char *requested_name,
+                             bool all_targets, ResolvedTargetList *list, Diagnostic *diag) {
+    if (config->targets.len == 0) {
+        if (all_targets) {
+            return mazen_target_resolve_all(project, config, list, diag);
+        }
+
+        {
+            ResolvedTarget resolved;
+            ResolvedTarget *slot;
+
+            resolved_target_init(&resolved);
+            if (!mazen_target_resolve(project, config, requested_name, &resolved, diag)) {
+                resolved_target_free(&resolved);
+                return false;
+            }
+            slot = resolved_target_list_push(list);
+            *slot = resolved;
+            return true;
+        }
+    }
+
+    {
+        unsigned char *states = mazen_xcalloc(config->targets.len, sizeof(*states));
+        StringList stack;
+        const char *default_name = NULL;
+        bool ok = true;
+        size_t i;
+
+        string_list_init(&stack);
+
+        if (all_targets) {
+            if (!determine_batch_default_name(config, &default_name, diag)) {
+                ok = false;
+            } else {
+                for (i = 0; ok && i < config->targets.len; ++i) {
+                    ok = collect_config_graph_target(project, config, i, states, &stack, list, diag);
+                }
+            }
+        } else {
+            const MazenTargetConfig *selected = NULL;
+            bool ignored_default = false;
+
+            selected = select_config_target(config, requested_name, &ignored_default, diag);
+            if (selected == NULL) {
+                ok = false;
+            } else {
+                default_name = selected->name;
+                ok = collect_config_graph_target(project, config, config_target_index(config, selected->name), states,
+                                                 &stack, list, diag);
+            }
+        }
+
+        if (ok) {
+            mark_default_target(list, default_name);
+        }
+
+        string_list_free(&stack);
+        free(states);
+        return ok;
+    }
+}
+
+bool mazen_target_plan_tests(const ProjectInfo *project, const struct MazenConfig *config, const char *requested_name,
+                             const char *filter, ResolvedTargetList *list, Diagnostic *diag) {
+    if (config->targets.len == 0) {
+        size_t i;
+
+        if (requested_name != NULL) {
+            diag_set(diag, "test target `%s` was requested, but mazen.toml does not define explicit targets",
+                     requested_name);
+            return false;
+        }
+
+        for (i = 0; i < project->sources.len; ++i) {
+            const SourceFile *source = &project->sources.items[i];
+            ResolvedTarget *resolved;
+            char *base_name;
+
+            if (!source->has_main || source->role != SOURCE_ROLE_TEST) {
+                continue;
+            }
+            if (filter != NULL && strstr(source->path, filter) == NULL) {
+                continue;
+            }
+
+            resolved = resolved_target_list_push(list);
+            resolved->from_config = false;
+            resolved->is_test = true;
+            resolved->install_enabled = false;
+            resolved->type = MAZEN_TARGET_EXECUTABLE;
+            base_name = sanitize_stem(source->path);
+            resolved->name = base_name;
+            resolved->output_path = mazen_format("build/%s", resolved->name);
+            resolved->entry_path = mazen_xstrdup(source->path);
+            collect_legacy_executable_sources(project, i, &resolved->source_paths);
+            string_list_push_unique(&resolved->source_paths, source->path);
+        }
+
+        if (list->len == 0) {
+            diag_set(diag, filter != NULL ? "no test entrypoints matched `%s`" : "no test entrypoints were detected",
+                     filter);
+            diag_set_hint(diag, "Add test sources under `tests/` or define explicit test targets in mazen.toml");
+            return false;
+        }
+        return true;
+    }
+
+    {
+        unsigned char *states = mazen_xcalloc(config->targets.len, sizeof(*states));
+        bool *selected = mazen_xcalloc(config->targets.len, sizeof(*selected));
+        StringList stack;
+        bool ok;
+        size_t i;
+
+        string_list_init(&stack);
+        ok = select_test_root(project, config, requested_name, filter, selected, diag);
+        if (ok) {
+            for (i = 0; ok && i < config->targets.len; ++i) {
+                if (!selected[i]) {
+                    continue;
+                }
+                ok = collect_config_graph_target(project, config, i, states, &stack, list, diag);
+            }
+        }
+
+        string_list_free(&stack);
+        free(selected);
+        free(states);
+        return ok;
+    }
+}
+
 void mazen_target_print_list(const ProjectInfo *project, const struct MazenConfig *config) {
     size_t i;
     (void) project;
@@ -769,11 +1176,24 @@ void mazen_target_print_list(const ProjectInfo *project, const struct MazenConfi
             (config->default_target == NULL && target->default_target)) {
             printf(" [default]");
         }
+        if (target->test_set ? target->test_target : target_cfg_looks_like_test(project, target)) {
+            printf(" [test]");
+        }
+        if (target->install_set && !target->install_target) {
+            printf(" [no-install]");
+        }
         if (target->entry != NULL) {
             printf(" entry=%s", target->entry);
         }
         if (target->output != NULL) {
             printf(" output=%s", target->output);
+        }
+        if (target->deps.len > 0) {
+            size_t j;
+            printf(" deps=");
+            for (j = 0; j < target->deps.len; ++j) {
+                printf("%s%s", j == 0 ? "" : ",", target->deps.items[j]);
+            }
         }
         putchar('\n');
     }

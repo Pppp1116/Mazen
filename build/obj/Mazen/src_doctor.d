@@ -1,2 +1,3 @@
 build/obj/Mazen/src_doctor.o: src/doctor.c src/doctor.h src/common.h \
-  src/config.h src/cli.h src/diag.h src/target.h src/standard.h
+  src/config.h src/cli.h src/diag.h src/profile.h src/target.h \
+  src/standard.h

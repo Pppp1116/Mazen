@@ -21,12 +21,16 @@ incremental rebuilds, and low friction for messy real-world trees.
 
 - Zero-config project discovery for C source trees
 - Named executable, static-library, and shared-library targets
+- Internal target dependency graphs for library and application build ordering
 - Batch builds with `--all-targets` for configured or discovered targets
 - Recursive scanning with sensible ignored directories
 - Entry-point inference with `main()` detection and target scoring
 - Automatic include directory inference from headers and `#include` usage
 - Clang-based incremental compilation with `.d` dependency files
 - Parallel compilation with `-j` and `--jobs`
+- First-class `mazen test` workflow with filtering and parallel execution
+- Install and uninstall workflows with configurable prefixes
+- Named build profiles in `mazen.toml`
 - `compile_commands.json` generation for editor and LSP tooling
 - Automatic inference for common system libraries like `m`, `pthread`, `dl`, `rt`, `curl`, `openssl`,
   `sqlite3`, `glib-2.0`, `gobject-2.0`, `pango-1.0`, and more
@@ -64,6 +68,8 @@ Mazen/
 │   ├── doctor.c
 │   ├── doctor.h
 │   ├── main.c
+│   ├── profile.c
+│   ├── profile.h
 │   ├── scanner.c
 │   ├── scanner.h
 │   ├── standard.c
@@ -126,7 +132,27 @@ Build the current project in release mode with `-O2`.
 mazen clean
 ```
 
-Remove the local `build/` directory.
+Remove build artifacts. You can also clean specific scopes:
+
+```sh
+mazen clean
+mazen clean objects
+mazen clean cache
+mazen clean outputs compdb
+```
+
+```sh
+mazen test
+```
+
+Build and run discovered or configured test targets.
+
+```sh
+mazen install
+mazen uninstall
+```
+
+Install or remove built artifacts using the configured prefix, or `--prefix`.
 
 ```sh
 mazen doctor
@@ -201,6 +227,7 @@ Parallel job control:
 ```sh
 mazen -j 8
 mazen release --jobs 4
+mazen test --parallel -j 4
 ```
 
 ## Default Compiler Flags
@@ -376,8 +403,11 @@ Example:
 name = "myapp"
 c_standard = "c23"
 jobs = 6
+default_profile = "asan"
 compile_commands_path = "build/compile_commands.json"
 default_target = "app"
+install_prefix = "/usr/local"
+install_headers = ["include/myapp/api.h", "include/myapp/math.h"]
 
 include_dirs = ["vendor/include"]
 libs = ["m", "pthread"]
@@ -391,11 +421,13 @@ type = "executable"
 entry = "src/main.c"
 sources = ["src/main.c", "src/app.c", "core/math.c"]
 output = "build/myapp"
+deps = ["math"]
 
 [target.math]
 type = "static"
 sources = ["core/math.c"]
 output = "build/libmath.a"
+install_dir = "lib"
 
 [target.plugin]
 type = "shared"
@@ -404,6 +436,23 @@ output = "build/libplugin.so"
 cflags = ["-DPLUGIN_BUILD=1"]
 include_dirs = ["plugins/include"]
 exclude = ["plugins/old"]
+
+[target.unit_math]
+type = "executable"
+entry = "tests/unit_math.c"
+sources = ["tests/unit_math.c"]
+deps = ["math"]
+test = true
+install = false
+
+[profile.asan]
+mode = "debug"
+cflags = ["-fsanitize=address", "-fno-omit-frame-pointer"]
+ldflags = ["-fsanitize=address"]
+
+[profile.size]
+mode = "release"
+cflags = ["-Oz"]
 ```
 
 Supported keys:
@@ -411,8 +460,11 @@ Supported keys:
 - `name`
 - `c_standard`
 - `jobs`
+- `default_profile`
 - `compile_commands_path`
 - `default_target`
+- `install_prefix`
+- `install_headers`
 - `include_dirs`
 - `libs`
 - `exclude`
@@ -426,8 +478,12 @@ Supported target-section keys:
 - `[target.NAME]`
 - `type = "executable" | "static" | "shared"`
 - `default = true`
+- `test = true | false`
+- `install = true | false`
 - `entry`
 - `output`
+- `install_dir`
+- `deps = ["other-target"]`
 - `src_dirs`
 - `sources`
 - `include_dirs`
@@ -435,6 +491,15 @@ Supported target-section keys:
 - `cflags`
 - `ldflags`
 - `exclude`
+
+Supported profile-section keys:
+
+- `[profile.NAME]`
+- `mode = "debug" | "release"`
+- `include_dirs`
+- `libs`
+- `cflags`
+- `ldflags`
 
 Command-line options can extend or override config values:
 
@@ -450,11 +515,11 @@ mazen --exclude examples
 ```
 
 The `doctor` command reports the active toolchain selection, including the
-compiler, resolved C standard, selected target, job count, and compile database
-path. With `mazen doctor --all-targets`, it also prints the full resolved target
-set for a batch build.
+compiler, resolved C standard, build mode, active profile, selected target, job
+count, and compile database path. With `mazen doctor --all-targets`, it also
+prints the full resolved target set for a batch build.
 
-## Explicit Targets And Libraries
+## Explicit Targets, Dependencies, And Libraries
 
 MAZEN supports debug and release builds for executable, static-library, and
 shared-library targets.
@@ -486,6 +551,31 @@ If multiple explicit targets exist, MAZEN uses this precedence:
 Otherwise MAZEN asks you to pick a target explicitly, unless you build them all
 with `--all-targets`.
 
+Targets can also depend on other internal targets. MAZEN resolves and builds
+them in topological order, then links dependent artifacts automatically:
+
+```toml
+[target.math]
+type = "static"
+src_dirs = ["libmath"]
+
+[target.engine]
+type = "static"
+src_dirs = ["libengine"]
+deps = ["math"]
+
+[target.app]
+type = "executable"
+entry = "app/main.c"
+deps = ["engine"]
+```
+
+That produces the expected build order:
+
+```text
+math -> engine -> app
+```
+
 Every build also refreshes a compile database. By default this is
 `compile_commands.json` in the project root, or the path set by
 `compile_commands_path`. Batch builds merge compile commands from every built
@@ -498,6 +588,45 @@ source usage, so projects using headers or symbols like `math.h`, `sqrt`,
 `PQconnectdb` usually work without a manual `--lib` flag. Explicit
 `libs = [...]` and `--lib NAME` values still take precedence when you want to
 pin or extend the link set.
+
+## Tests, Profiles, And Installation
+
+Test targets can be discovered heuristically from `tests/` paths, or defined
+explicitly with `test = true`. Use `mazen test` to build and run them:
+
+```sh
+mazen test
+mazen test --filter math
+mazen test --parallel -j 4
+```
+
+MAZEN exits non-zero if any selected test fails, which makes it usable in CI.
+
+Profiles let you keep reusable flag sets in `mazen.toml`:
+
+```sh
+mazen --profile asan
+mazen test --profile asan
+mazen install --profile size
+```
+
+Profile precedence is:
+
+1. CLI `--profile`
+2. config `default_profile`
+3. no profile
+
+Install and uninstall workflows use `/usr/local` by default, or the configured
+`install_prefix`, or an explicit CLI prefix:
+
+```sh
+mazen install
+mazen install --prefix /tmp/pkgroot
+mazen uninstall --prefix /tmp/pkgroot
+```
+
+Executables install into `bin/`, libraries into `lib/`, and headers into
+`include/` unless a target overrides `install_dir`.
 
 ## Typical Output
 

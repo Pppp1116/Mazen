@@ -23,8 +23,11 @@ typedef struct {
 typedef enum {
     MAZEN_CMD_BUILD = 0,
     MAZEN_CMD_RUN,
+    MAZEN_CMD_TEST,
     MAZEN_CMD_RELEASE,
     MAZEN_CMD_CLEAN,
+    MAZEN_CMD_INSTALL,
+    MAZEN_CMD_UNINSTALL,
     MAZEN_CMD_DOCTOR,
     MAZEN_CMD_LIST,
     MAZEN_CMD_STANDARDS,
@@ -36,6 +39,14 @@ typedef enum {
     MAZEN_BUILD_DEBUG = 0,
     MAZEN_BUILD_RELEASE
 } MazenBuildMode;
+
+typedef enum {
+    MAZEN_CLEAN_OBJECTS = 1u << 0,
+    MAZEN_CLEAN_CACHE = 1u << 1,
+    MAZEN_CLEAN_COMPDB = 1u << 2,
+    MAZEN_CLEAN_OUTPUTS = 1u << 3,
+    MAZEN_CLEAN_ALL = (1u << 4) - 1u
+} MazenCleanMode;
 
 typedef enum {
     DISCOVERY_CONVENTION = 0,
@@ -137,6 +148,7 @@ int ensure_directory(const char *path);
 int remove_tree(const char *path);
 char *read_text_file(const char *path, size_t *len_out);
 bool write_text_file(const char *path, const char *data, size_t len);
+bool copy_file_binary(const char *src_path, const char *dst_path);
 char *sanitize_stem(const char *path);
 uint64_t fnv1a_hash_bytes(const void *data, size_t len, uint64_t seed);
 uint64_t fnv1a_hash_string(const char *text, uint64_t seed);

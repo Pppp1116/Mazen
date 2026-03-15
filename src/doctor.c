@@ -17,20 +17,27 @@ static void print_string_list(const char *title, const StringList *list) {
 }
 
 void doctor_print_project(const ProjectInfo *project, const MazenConfig *config, const char *compiler,
-                          const MazenCStandard *standard, const ResolvedTarget *target, int jobs,
-                          const char *compile_commands_path) {
+                          const MazenCStandard *standard, MazenBuildMode mode, const char *profile_name,
+                          const ResolvedTarget *target, int jobs, const char *compile_commands_path) {
     size_t i;
 
     printf("Project root: %s\n", project->root_dir);
     printf("Project name: %s\n", project->project_name);
     printf("Compiler: %s\n", compiler);
     printf("C standard: %s\n", standard != NULL ? standard->name : mazen_standard_default()->name);
+    printf("Build mode: %s\n", mazen_build_mode_name(mode));
+    printf("Profile: %s\n", profile_name != NULL ? profile_name : "(none)");
     if (target != NULL) {
         printf("Target: %s\n", target->name);
         printf("Target type: %s\n", mazen_target_type_name(target->type));
         printf("Target output: %s\n", target->output_path);
+        printf("Target install: %s\n", target->install_enabled ? "enabled" : "disabled");
+        printf("Target role: %s\n", target->is_test ? "test" : "build");
         if (target->entry_path != NULL) {
             printf("Target entrypoint: %s\n", target->entry_path);
+        }
+        if (target->dep_names.len > 0) {
+            print_string_list("Target dependencies:", &target->dep_names);
         }
     }
     if (jobs > 0) {
@@ -80,6 +87,19 @@ void doctor_print_resolved_targets(const ResolvedTargetList *targets) {
         }
         if (target->is_default) {
             printf(" [default]");
+        }
+        if (target->is_test) {
+            printf(" [test]");
+        }
+        if (!target->install_enabled) {
+            printf(" [no-install]");
+        }
+        if (target->dep_names.len > 0) {
+            size_t j;
+            printf(" deps=");
+            for (j = 0; j < target->dep_names.len; ++j) {
+                printf("%s%s", j == 0 ? "" : ",", target->dep_names.items[j]);
+            }
         }
         putchar('\n');
     }

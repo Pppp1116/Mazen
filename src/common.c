@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -599,6 +600,56 @@ bool write_text_file(const char *path, const char *data, size_t len) {
     written = fwrite(data, 1, len, file);
     fclose(file);
     return written == len;
+}
+
+bool copy_file_binary(const char *src_path, const char *dst_path) {
+    int src_fd;
+    int dst_fd;
+    struct stat st;
+    char buffer[16384];
+    ssize_t count;
+
+    src_fd = open(src_path, O_RDONLY);
+    if (src_fd < 0) {
+        return false;
+    }
+    if (fstat(src_fd, &st) != 0) {
+        close(src_fd);
+        return false;
+    }
+
+    dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
+    if (dst_fd < 0) {
+        close(src_fd);
+        return false;
+    }
+
+    while ((count = read(src_fd, buffer, sizeof(buffer))) > 0) {
+        ssize_t written = 0;
+
+        while (written < count) {
+            ssize_t rc = write(dst_fd, buffer + written, (size_t) (count - written));
+            if (rc < 0) {
+                close(src_fd);
+                close(dst_fd);
+                return false;
+            }
+            written += rc;
+        }
+    }
+
+    close(src_fd);
+    if (close(dst_fd) != 0) {
+        return false;
+    }
+    if (count < 0) {
+        return false;
+    }
+    if (chmod(dst_path, st.st_mode & 0777) != 0) {
+        return false;
+    }
+
+    return true;
 }
 
 char *sanitize_stem(const char *path) {

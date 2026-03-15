@@ -9,12 +9,14 @@
 
 typedef enum {
     CONFIG_SECTION_GLOBAL = 0,
-    CONFIG_SECTION_TARGET
+    CONFIG_SECTION_TARGET,
+    CONFIG_SECTION_PROFILE
 } ConfigSectionKind;
 
 typedef struct {
     ConfigSectionKind kind;
     MazenTargetConfig *target;
+    MazenProfile *profile;
 } ConfigSection;
 
 static void config_string_list_merge(StringList *dst, const StringList *src, bool unique) {
@@ -326,6 +328,35 @@ static bool parse_section_header(const char *text, size_t line, ConfigSection *s
         free(name);
         return true;
     }
+    if (strcmp(name, "profile") == 0 || strcmp(name, "profiles") == 0) {
+        free(name);
+        diag_set(diag, "mazen.toml:%zu: profile sections must use `[profile.NAME]` or `[profiles.NAME]`", line);
+        return false;
+    }
+    if (string_starts_with(name, "profile.") || string_starts_with(name, "profiles.")) {
+        const char *profile_name = string_starts_with(name, "profile.") ? name + 8 : name + 9;
+        MazenProfile *profile;
+
+        if (*profile_name == '\0') {
+            free(name);
+            diag_set(diag, "mazen.toml:%zu: profile sections must use `[profile.NAME]`", line);
+            return false;
+        }
+        if (mazen_profile_list_find(&config->profiles, profile_name) != NULL) {
+            char *duplicate_name = mazen_xstrdup(profile_name);
+            free(name);
+            diag_set(diag, "mazen.toml:%zu: duplicate profile section `%s`", line, duplicate_name);
+            free(duplicate_name);
+            return false;
+        }
+
+        profile = mazen_profile_list_push(&config->profiles, profile_name);
+        section->kind = CONFIG_SECTION_PROFILE;
+        section->profile = profile;
+        section->target = NULL;
+        free(name);
+        return true;
+    }
 
     free(name);
     diag_set(diag, "mazen.toml:%zu: unsupported section header", line);
@@ -393,11 +424,17 @@ static bool assign_global_key(MazenConfig *config, const char *key, const char *
         config->jobs_set = true;
         return true;
     }
+    if (strcmp(key, "default_profile") == 0) {
+        return assign_string_field(&config->default_profile, value_text, line, diag);
+    }
     if (strcmp(key, "default_target") == 0) {
         return assign_string_field(&config->default_target, value_text, line, diag);
     }
     if (strcmp(key, "compile_commands_path") == 0) {
         return assign_string_field(&config->compile_commands_path, value_text, line, diag);
+    }
+    if (strcmp(key, "install_prefix") == 0) {
+        return assign_string_field(&config->install_prefix, value_text, line, diag);
     }
     if (strcmp(key, "include_dirs") == 0) {
         return assign_string_list_field(&config->include_dirs, value_text, line, diag);
@@ -419,6 +456,9 @@ static bool assign_global_key(MazenConfig *config, const char *key, const char *
     }
     if (strcmp(key, "ldflags") == 0) {
         return assign_string_list_field(&config->ldflags, value_text, line, diag);
+    }
+    if (strcmp(key, "install_headers") == 0) {
+        return assign_string_list_field(&config->install_headers, value_text, line, diag);
     }
 
     diag_set(diag, "mazen.toml:%zu: unsupported key `%s`", line, key);
@@ -452,11 +492,32 @@ static bool assign_target_key(MazenTargetConfig *target, const char *key, const 
         target->default_target = value;
         return true;
     }
+    if (strcmp(key, "test") == 0) {
+        bool value = false;
+        if (!parse_bool_value(value_text, line, &value, diag)) {
+            return false;
+        }
+        target->test_target = value;
+        target->test_set = true;
+        return true;
+    }
+    if (strcmp(key, "install") == 0) {
+        bool value = false;
+        if (!parse_bool_value(value_text, line, &value, diag)) {
+            return false;
+        }
+        target->install_target = value;
+        target->install_set = true;
+        return true;
+    }
     if (strcmp(key, "entry") == 0) {
         return assign_string_field(&target->entry, value_text, line, diag);
     }
     if (strcmp(key, "output") == 0) {
         return assign_string_field(&target->output, value_text, line, diag);
+    }
+    if (strcmp(key, "install_dir") == 0) {
+        return assign_string_field(&target->install_dir, value_text, line, diag);
     }
     if (strcmp(key, "src_dirs") == 0) {
         return assign_string_list_field(&target->src_dirs, value_text, line, diag);
@@ -479,8 +540,47 @@ static bool assign_target_key(MazenTargetConfig *target, const char *key, const 
     if (strcmp(key, "exclude") == 0) {
         return assign_string_list_field(&target->exclude, value_text, line, diag);
     }
+    if (strcmp(key, "deps") == 0 || strcmp(key, "dependencies") == 0) {
+        return assign_string_list_field(&target->deps, value_text, line, diag);
+    }
 
     diag_set(diag, "mazen.toml:%zu: unsupported target key `%s`", line, key);
+    return false;
+}
+
+static bool assign_profile_key(MazenProfile *profile, const char *key, const char *value_text, size_t line,
+                               Diagnostic *diag) {
+    if (strcmp(key, "mode") == 0) {
+        char *parsed = NULL;
+        MazenBuildMode mode;
+
+        if (!parse_string_value(value_text, line, &parsed, diag)) {
+            return false;
+        }
+        if (!mazen_build_mode_from_text(parsed, &mode)) {
+            diag_set(diag, "mazen.toml:%zu: unsupported profile mode `%s`", line, parsed);
+            free(parsed);
+            return false;
+        }
+        profile->mode = mode;
+        profile->mode_set = true;
+        free(parsed);
+        return true;
+    }
+    if (strcmp(key, "include_dirs") == 0) {
+        return assign_string_list_field(&profile->include_dirs, value_text, line, diag);
+    }
+    if (strcmp(key, "libs") == 0) {
+        return assign_string_list_field(&profile->libs, value_text, line, diag);
+    }
+    if (strcmp(key, "cflags") == 0) {
+        return assign_string_list_field(&profile->cflags, value_text, line, diag);
+    }
+    if (strcmp(key, "ldflags") == 0) {
+        return assign_string_list_field(&profile->ldflags, value_text, line, diag);
+    }
+
+    diag_set(diag, "mazen.toml:%zu: unsupported profile key `%s`", line, key);
     return false;
 }
 
@@ -491,8 +591,10 @@ void config_init(MazenConfig *config) {
     config->c_standard = NULL;
     config->jobs = 0;
     config->jobs_set = false;
+    config->default_profile = NULL;
     config->default_target = NULL;
     config->compile_commands_path = NULL;
+    config->install_prefix = NULL;
     string_list_init(&config->include_dirs);
     string_list_init(&config->libs);
     string_list_init(&config->exclude);
@@ -500,6 +602,8 @@ void config_init(MazenConfig *config) {
     string_list_init(&config->sources);
     string_list_init(&config->cflags);
     string_list_init(&config->ldflags);
+    string_list_init(&config->install_headers);
+    mazen_profile_list_init(&config->profiles);
     mazen_target_config_list_init(&config->targets);
 }
 
@@ -507,8 +611,10 @@ void config_free(MazenConfig *config) {
     free(config->path);
     free(config->name);
     free(config->c_standard);
+    free(config->default_profile);
     free(config->default_target);
     free(config->compile_commands_path);
+    free(config->install_prefix);
     string_list_free(&config->include_dirs);
     string_list_free(&config->libs);
     string_list_free(&config->exclude);
@@ -516,6 +622,8 @@ void config_free(MazenConfig *config) {
     string_list_free(&config->sources);
     string_list_free(&config->cflags);
     string_list_free(&config->ldflags);
+    string_list_free(&config->install_headers);
+    mazen_profile_list_free(&config->profiles);
     mazen_target_config_list_free(&config->targets);
     config_init(config);
 }
@@ -542,6 +650,7 @@ bool config_load(const char *root_dir, MazenConfig *config, Diagnostic *diag) {
 
     section.kind = CONFIG_SECTION_GLOBAL;
     section.target = NULL;
+    section.profile = NULL;
     config->present = true;
     config->path = path;
 
@@ -616,8 +725,10 @@ bool config_load(const char *root_dir, MazenConfig *config, Diagnostic *diag) {
 
         if (section.kind == CONFIG_SECTION_GLOBAL) {
             ok = assign_global_key(config, key, value_copy, line_number, diag);
-        } else {
+        } else if (section.kind == CONFIG_SECTION_TARGET) {
             ok = assign_target_key(section.target, key, value_copy, line_number, diag);
+        } else {
+            ok = assign_profile_key(section.profile, key, value_copy, line_number, diag);
         }
 
         free(value_copy);

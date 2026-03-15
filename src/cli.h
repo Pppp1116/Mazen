@@ -8,10 +8,16 @@ typedef struct {
     MazenCommand command;
     bool verbose;
     bool all_targets;
+    bool test_parallel;
     int jobs;
     bool jobs_set;
+    unsigned int clean_mask;
+    bool clean_mask_set;
     char *compiler;
     char *c_standard;
+    char *profile_name;
+    char *test_filter;
+    char *install_prefix;
     char *name_override;
     char *target_name;
     StringList include_dirs;

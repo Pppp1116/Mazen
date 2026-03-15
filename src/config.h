@@ -4,6 +4,7 @@
 #include "cli.h"
 #include "common.h"
 #include "diag.h"
+#include "profile.h"
 #include "target.h"
 
 typedef struct MazenConfig {
@@ -13,8 +14,10 @@ typedef struct MazenConfig {
     char *c_standard;
     int jobs;
     bool jobs_set;
+    char *default_profile;
     char *default_target;
     char *compile_commands_path;
+    char *install_prefix;
     StringList include_dirs;
     StringList libs;
     StringList exclude;
@@ -22,6 +25,8 @@ typedef struct MazenConfig {
     StringList sources;
     StringList cflags;
     StringList ldflags;
+    StringList install_headers;
+    MazenProfileList profiles;
     MazenTargetConfigList targets;
 } MazenConfig;
 

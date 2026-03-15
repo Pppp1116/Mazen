@@ -15,10 +15,45 @@ typedef struct {
 } CommandEntry;
 
 static const CommandEntry COMMANDS[] = {
-    {"build", MAZEN_CMD_BUILD},         {"run", MAZEN_CMD_RUN},
-    {"release", MAZEN_CMD_RELEASE},     {"clean", MAZEN_CMD_CLEAN},
-    {"doctor", MAZEN_CMD_DOCTOR},       {"list", MAZEN_CMD_LIST},
-    {"standards", MAZEN_CMD_STANDARDS}, {"help", MAZEN_CMD_HELP}};
+    {"build", MAZEN_CMD_BUILD},
+    {"run", MAZEN_CMD_RUN},
+    {"test", MAZEN_CMD_TEST},
+    {"release", MAZEN_CMD_RELEASE},
+    {"clean", MAZEN_CMD_CLEAN},
+    {"install", MAZEN_CMD_INSTALL},
+    {"uninstall", MAZEN_CMD_UNINSTALL},
+    {"doctor", MAZEN_CMD_DOCTOR},
+    {"list", MAZEN_CMD_LIST},
+    {"standards", MAZEN_CMD_STANDARDS},
+    {"help", MAZEN_CMD_HELP}};
+
+static bool parse_clean_scope_value(const char *value, unsigned int *mask,
+                                    Diagnostic *diag) {
+  if (strcmp(value, "all") == 0) {
+    *mask |= MAZEN_CLEAN_ALL;
+    return true;
+  }
+  if (strcmp(value, "objects") == 0 || strcmp(value, "obj") == 0) {
+    *mask |= MAZEN_CLEAN_OBJECTS;
+    return true;
+  }
+  if (strcmp(value, "cache") == 0) {
+    *mask |= MAZEN_CLEAN_CACHE;
+    return true;
+  }
+  if (strcmp(value, "compdb") == 0 || strcmp(value, "compile-commands") == 0 ||
+      strcmp(value, "compile_commands") == 0) {
+    *mask |= MAZEN_CLEAN_COMPDB;
+    return true;
+  }
+  if (strcmp(value, "outputs") == 0 || strcmp(value, "artifacts") == 0) {
+    *mask |= MAZEN_CLEAN_OUTPUTS;
+    return true;
+  }
+
+  diag_set(diag, "unsupported clean scope `%s`", value);
+  return false;
+}
 
 static bool validate_standard_value(const char *value, const char *option_name,
                                     Diagnostic *diag) {
@@ -86,10 +121,16 @@ void cli_options_init(CliOptions *options) {
   options->command = MAZEN_CMD_BUILD;
   options->verbose = false;
   options->all_targets = false;
+  options->test_parallel = false;
   options->jobs = 0;
   options->jobs_set = false;
+  options->clean_mask = MAZEN_CLEAN_ALL;
+  options->clean_mask_set = false;
   options->compiler = NULL;
   options->c_standard = NULL;
+  options->profile_name = NULL;
+  options->test_filter = NULL;
+  options->install_prefix = NULL;
   options->name_override = NULL;
   options->target_name = NULL;
   string_list_init(&options->include_dirs);
@@ -104,6 +145,9 @@ void cli_options_init(CliOptions *options) {
 void cli_options_free(CliOptions *options) {
   free(options->compiler);
   free(options->c_standard);
+  free(options->profile_name);
+  free(options->test_filter);
+  free(options->install_prefix);
   free(options->name_override);
   free(options->target_name);
   string_list_free(&options->include_dirs);
@@ -139,6 +183,18 @@ bool cli_parse(int argc, char **argv, CliOptions *options, Diagnostic *diag) {
       if (!seen_command && command_from_text(arg, &command)) {
         options->command = command;
         seen_command = true;
+        continue;
+      }
+      if (seen_command && options->command == MAZEN_CMD_CLEAN) {
+        unsigned int mask = 0;
+        if (!options->clean_mask_set) {
+          options->clean_mask = 0;
+          options->clean_mask_set = true;
+        }
+        if (!parse_clean_scope_value(arg, &mask, diag)) {
+          return false;
+        }
+        options->clean_mask |= mask;
         continue;
       }
       diag_set(diag, "unexpected argument `%s`", arg);
@@ -213,6 +269,10 @@ bool cli_parse(int argc, char **argv, CliOptions *options, Diagnostic *diag) {
       options->verbose = true;
       continue;
     }
+    if (strcmp(arg, "--parallel") == 0) {
+      options->test_parallel = true;
+      continue;
+    }
     if (strcmp(arg, "--all-targets") == 0) {
       options->all_targets = true;
       continue;
@@ -234,6 +294,38 @@ bool cli_parse(int argc, char **argv, CliOptions *options, Diagnostic *diag) {
       }
       free(options->name_override);
       options->name_override = mazen_xstrdup(value);
+      continue;
+    }
+    if (strcmp(arg, "--profile") == 0 ||
+        string_starts_with(arg, "--profile=")) {
+      const char *value = NULL;
+      if (!take_option_value(argc, argv, &i, arg, "--profile", &value, diag)) {
+        return false;
+      }
+      if (value[0] == '\0') {
+        diag_set(diag, "--profile requires a non-empty profile name");
+        return false;
+      }
+      free(options->profile_name);
+      options->profile_name = mazen_xstrdup(value);
+      continue;
+    }
+    if (strcmp(arg, "--filter") == 0 || string_starts_with(arg, "--filter=")) {
+      const char *value = NULL;
+      if (!take_option_value(argc, argv, &i, arg, "--filter", &value, diag)) {
+        return false;
+      }
+      free(options->test_filter);
+      options->test_filter = mazen_xstrdup(value);
+      continue;
+    }
+    if (strcmp(arg, "--prefix") == 0 || string_starts_with(arg, "--prefix=")) {
+      const char *value = NULL;
+      if (!take_option_value(argc, argv, &i, arg, "--prefix", &value, diag)) {
+        return false;
+      }
+      free(options->install_prefix);
+      options->install_prefix = mazen_xstrdup(value);
       continue;
     }
     if (strcmp(arg, "--lib") == 0 || string_starts_with(arg, "--lib=")) {
@@ -315,8 +407,11 @@ void cli_print_help(void) {
   puts("Commands:");
   puts("  build      Build the project in debug mode (default)");
   puts("  run        Build and run the detected executable");
+  puts("  test       Build and run discovered test targets");
   puts("  release    Build the project in release mode");
   puts("  clean      Remove build artifacts");
+  puts("  install    Build and install project artifacts");
+  puts("  uninstall  Remove installed project artifacts");
   puts("  doctor     Analyze project discovery and build inference");
   puts("  list       List detected entry targets");
   puts("  standards  List supported C language standards");
@@ -327,7 +422,11 @@ void cli_print_help(void) {
   puts("  --target NAME        Build an explicit target from mazen.toml");
   puts("  --all-targets        Build every resolved target in one pass");
   puts("  -j, --jobs COUNT     Compile sources in parallel");
+  puts("  --parallel           Run tests in parallel");
   puts("  --std VALUE          Select the C language standard");
+  puts("  --profile NAME       Apply a named build profile");
+  puts("  --filter TEXT        Filter tests by target or path");
+  puts("  --prefix PATH        Choose the install prefix");
   puts("  --name NAME          Override output binary name");
   puts("  --lib LIB            Link an extra library, repeatable");
   puts("  -I DIR               Add an include directory, repeatable");
@@ -341,6 +440,11 @@ void cli_print_help(void) {
   puts("");
   puts("Run arguments:");
   puts("  mazen run -- arg1 arg2");
+  puts("");
+  puts("Clean scopes:");
+  puts("  mazen clean");
+  puts("  mazen clean objects cache");
+  puts("  mazen clean outputs compdb");
 }
 
 const char *cli_command_name(MazenCommand command) {
@@ -349,10 +453,16 @@ const char *cli_command_name(MazenCommand command) {
     return "build";
   case MAZEN_CMD_RUN:
     return "run";
+  case MAZEN_CMD_TEST:
+    return "test";
   case MAZEN_CMD_RELEASE:
     return "release";
   case MAZEN_CMD_CLEAN:
     return "clean";
+  case MAZEN_CMD_INSTALL:
+    return "install";
+  case MAZEN_CMD_UNINSTALL:
+    return "uninstall";
   case MAZEN_CMD_DOCTOR:
     return "doctor";
   case MAZEN_CMD_LIST:

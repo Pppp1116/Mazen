@@ -1,12 +1,18 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "build.h"
 
 #include "autolib.h"
 #include "compdb.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -296,6 +302,80 @@ static bool run_command_passthrough(const char *cwd, const StringList *args, Dia
     return false;
 }
 
+static char *library_path_value(const StringList *dirs) {
+    const char *existing = getenv("LD_LIBRARY_PATH");
+    String value;
+    size_t i;
+
+    if (dirs->len == 0) {
+        return existing != NULL && *existing != '\0' ? mazen_xstrdup(existing) : NULL;
+    }
+
+    string_init(&value);
+    for (i = 0; i < dirs->len; ++i) {
+        if (i > 0) {
+            string_append_char(&value, ':');
+        }
+        string_append(&value, dirs->items[i]);
+    }
+    if (existing != NULL && *existing != '\0') {
+        if (value.len > 0) {
+            string_append_char(&value, ':');
+        }
+        string_append(&value, existing);
+    }
+
+    return string_take(&value);
+}
+
+static bool run_command_passthrough_env(const char *cwd, const StringList *args, const char *library_path,
+                                        Diagnostic *diag) {
+    pid_t child;
+    int status;
+    char **argv;
+
+    child = fork();
+    if (child < 0) {
+        diag_set(diag, "failed to fork: %s", strerror(errno));
+        return false;
+    }
+
+    if (child == 0) {
+        argv = argv_from_list(args);
+        if (cwd != NULL && chdir(cwd) != 0) {
+            fprintf(stderr, "failed to enter %s: %s\n", cwd, strerror(errno));
+            _exit(127);
+        }
+        if (library_path != NULL) {
+            setenv("LD_LIBRARY_PATH", library_path, 1);
+        }
+        execvp(argv[0], argv);
+        fprintf(stderr, "failed to execute %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            diag_set(diag, "failed waiting for child process: %s", strerror(errno));
+            return false;
+        }
+    }
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return true;
+    }
+
+    if (WIFEXITED(status)) {
+        diag_set(diag, "program exited with status %d", WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        diag_set(diag, "program terminated by signal %d", WTERMSIG(status));
+    } else {
+        diag_set(diag, "program execution failed");
+    }
+
+    return false;
+}
+
 static bool spawn_command(const char *cwd, const StringList *args, pid_t *pid_out, Diagnostic *diag) {
     pid_t child;
     char **argv;
@@ -314,6 +394,38 @@ static bool spawn_command(const char *cwd, const StringList *args, pid_t *pid_ou
         if (cwd != NULL && chdir(cwd) != 0) {
             fprintf(stderr, "failed to enter %s: %s\n", cwd, strerror(errno));
             _exit(127);
+        }
+        execvp(argv[0], argv);
+        fprintf(stderr, "failed to execute %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    *pid_out = child;
+    return true;
+}
+
+static bool spawn_command_env(const char *cwd, const StringList *args, const char *library_path, pid_t *pid_out,
+                              Diagnostic *diag) {
+    pid_t child;
+    char **argv;
+
+    fflush(stdout);
+    fflush(stderr);
+
+    child = fork();
+    if (child < 0) {
+        diag_set(diag, "failed to fork: %s", strerror(errno));
+        return false;
+    }
+
+    if (child == 0) {
+        argv = argv_from_list(args);
+        if (cwd != NULL && chdir(cwd) != 0) {
+            fprintf(stderr, "failed to enter %s: %s\n", cwd, strerror(errno));
+            _exit(127);
+        }
+        if (library_path != NULL) {
+            setenv("LD_LIBRARY_PATH", library_path, 1);
         }
         execvp(argv[0], argv);
         fprintf(stderr, "failed to execute %s: %s\n", argv[0], strerror(errno));
@@ -359,6 +471,23 @@ static char *resolve_path(const char *root_dir, const char *path) {
         return mazen_xstrdup(path);
     }
     return path_join(root_dir, path);
+}
+
+static const char *path_after_prefix_dir(const char *path, const char *prefix) {
+    size_t len;
+
+    if (path == NULL || prefix == NULL) {
+        return NULL;
+    }
+
+    len = strlen(prefix);
+    if (strcmp(path, prefix) == 0) {
+        return path + len;
+    }
+    if (string_starts_with(path, prefix) && path[len] == '/') {
+        return path + len + 1;
+    }
+    return NULL;
 }
 
 static bool ensure_parent_directory(const char *root_dir, const char *path, Diagnostic *diag) {
@@ -431,6 +560,10 @@ static void make_signatures(const BuildRequest *request, const StringList *link_
                    (int) request->target_type);
     string_appendf(&link, "compiler=%s\nmode=%d\ntype=%d\noutput=%s\n", request->compiler, (int) request->mode,
                    (int) request->target_type, request->output_path != NULL ? request->output_path : "");
+    if (request->profile_name != NULL) {
+        string_appendf(&compile, "profile=%s\n", request->profile_name);
+        string_appendf(&link, "profile=%s\n", request->profile_name);
+    }
 
     if (request->entry_path != NULL) {
         string_appendf(&link, "entry=%s\n", request->entry_path);
@@ -446,6 +579,9 @@ static void make_signatures(const BuildRequest *request, const StringList *link_
     }
     for (i = 0; i < link_libs->len; ++i) {
         string_appendf(&link, "L=%s\n", link_libs->items[i]);
+    }
+    for (i = 0; i < request->dependency_outputs.len; ++i) {
+        string_appendf(&link, "D=%s\n", request->dependency_outputs.items[i]);
     }
     for (i = 0; i < request->source_paths.len; ++i) {
         string_appendf(&compile, "S=%s\n", request->source_paths.items[i]);
@@ -465,6 +601,7 @@ void build_request_init(BuildRequest *request) {
     request->compiler = "clang";
     request->standard = mazen_standard_default();
     request->mode = MAZEN_BUILD_DEBUG;
+    request->profile_name = NULL;
     request->run_after_build = false;
     request->verbose = false;
     request->jobs = 0;
@@ -479,6 +616,8 @@ void build_request_init(BuildRequest *request) {
     string_list_init(&request->libs);
     string_list_init(&request->cflags);
     string_list_init(&request->ldflags);
+    string_list_init(&request->dependency_outputs);
+    string_list_init(&request->runtime_library_dirs);
     string_list_init(&request->run_args);
 }
 
@@ -492,6 +631,8 @@ void build_request_free(BuildRequest *request) {
     string_list_free(&request->libs);
     string_list_free(&request->cflags);
     string_list_free(&request->ldflags);
+    string_list_free(&request->dependency_outputs);
+    string_list_free(&request->runtime_library_dirs);
     string_list_free(&request->run_args);
     build_request_init(request);
 }
@@ -521,59 +662,143 @@ static bool remove_optional_path(const char *root_dir, const char *path, Diagnos
     return true;
 }
 
-bool build_clean(const char *root_dir, const MazenConfig *config, Diagnostic *diag) {
-    bool removed_any = false;
-    char *build_dir = path_join(root_dir, "build");
-    size_t i;
+static bool path_exists_resolved(const char *root_dir, const char *path) {
+    char *absolute;
+    bool exists;
 
-    if (dir_exists(build_dir)) {
-        if (remove_tree(build_dir) != 0) {
-            diag_set(diag, "failed to remove `%s`: %s", build_dir, strerror(errno));
+    if (path == NULL || *path == '\0') {
+        return false;
+    }
+
+    absolute = resolve_path(root_dir, path);
+    exists = file_exists(absolute) || dir_exists(absolute);
+    free(absolute);
+    return exists;
+}
+
+static bool remove_optional_and_track(const char *root_dir, const char *path, bool *removed_any, Diagnostic *diag) {
+    bool existed = path_exists_resolved(root_dir, path);
+
+    if (!remove_optional_path(root_dir, path, diag)) {
+        return false;
+    }
+    if (existed) {
+        *removed_any = true;
+    }
+    return true;
+}
+
+static bool clean_build_outputs_dir(const char *root_dir, bool *removed_any, Diagnostic *diag) {
+    char *build_dir = path_join(root_dir, "build");
+    DIR *dir;
+    struct dirent *entry;
+
+    if (!dir_exists(build_dir)) {
+        free(build_dir);
+        return true;
+    }
+
+    dir = opendir(build_dir);
+    if (dir == NULL) {
+        diag_set(diag, "failed to read `%s`: %s", build_dir, strerror(errno));
+        free(build_dir);
+        return false;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        char *child;
+
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (strcmp(entry->d_name, "obj") == 0 || strcmp(entry->d_name, ".mazen") == 0) {
+            continue;
+        }
+
+        child = path_join(build_dir, entry->d_name);
+        if (remove_tree(child) != 0) {
+            diag_set(diag, "failed to remove `%s`: %s", child, strerror(errno));
+            free(child);
+            closedir(dir);
             free(build_dir);
             return false;
         }
-        removed_any = true;
+        *removed_any = true;
+        free(child);
     }
+
+    closedir(dir);
     free(build_dir);
+    return true;
+}
 
-    if (config != NULL) {
-        const char *compdb_path = config->compile_commands_path != NULL ? config->compile_commands_path
-                                                                        : "compile_commands.json";
-        {
-            char *abs = resolve_path(root_dir, compdb_path);
-            bool existed = file_exists(abs) || dir_exists(abs);
-            free(abs);
-            if (!remove_optional_path(root_dir, compdb_path, diag)) {
-                return false;
-            }
-            if (existed) {
-                removed_any = true;
-            }
-        }
+static bool remove_target_outputs(const char *root_dir, const MazenConfig *config, bool *removed_any, Diagnostic *diag) {
+    size_t i;
 
-        for (i = 0; i < config->targets.len; ++i) {
-            const MazenTargetConfig *target = &config->targets.items[i];
-            if (target->output != NULL) {
-                char *abs = resolve_path(root_dir, target->output);
-                bool existed = file_exists(abs) || dir_exists(abs);
-                free(abs);
-                if (!remove_optional_path(root_dir, target->output, diag)) {
-                    return false;
-                }
-                if (existed) {
-                    removed_any = true;
-                }
-            }
+    if (config == NULL) {
+        return true;
+    }
+
+    for (i = 0; i < config->targets.len; ++i) {
+        const MazenTargetConfig *target = &config->targets.items[i];
+        if (target->output == NULL) {
+            continue;
         }
-    } else {
-        char *abs = resolve_path(root_dir, "compile_commands.json");
-        bool existed = file_exists(abs) || dir_exists(abs);
-        free(abs);
-        if (!remove_optional_path(root_dir, "compile_commands.json", diag)) {
+        if (!remove_optional_and_track(root_dir, target->output, removed_any, diag)) {
             return false;
         }
-        if (existed) {
+    }
+
+    return true;
+}
+
+bool build_clean(const char *root_dir, const MazenConfig *config, unsigned int clean_mask, Diagnostic *diag) {
+    bool removed_any = false;
+    unsigned int mask = clean_mask == 0 ? MAZEN_CLEAN_ALL : clean_mask;
+    const char *compdb_path;
+
+    compdb_path = config != NULL && config->compile_commands_path != NULL ? config->compile_commands_path
+                                                                          : "compile_commands.json";
+
+    if ((mask & MAZEN_CLEAN_ALL) == MAZEN_CLEAN_ALL) {
+        char *build_dir = path_join(root_dir, "build");
+
+        if (dir_exists(build_dir)) {
+            if (remove_tree(build_dir) != 0) {
+                diag_set(diag, "failed to remove `%s`: %s", build_dir, strerror(errno));
+                free(build_dir);
+                return false;
+            }
             removed_any = true;
+        }
+        free(build_dir);
+
+        if (!remove_target_outputs(root_dir, config, &removed_any, diag)) {
+            return false;
+        }
+        if (!remove_optional_and_track(root_dir, compdb_path, &removed_any, diag)) {
+            return false;
+        }
+    } else {
+        if ((mask & MAZEN_CLEAN_OBJECTS) != 0 &&
+            !remove_optional_and_track(root_dir, "build/obj", &removed_any, diag)) {
+            return false;
+        }
+        if ((mask & MAZEN_CLEAN_CACHE) != 0 &&
+            !remove_optional_and_track(root_dir, "build/.mazen", &removed_any, diag)) {
+            return false;
+        }
+        if ((mask & MAZEN_CLEAN_OUTPUTS) != 0) {
+            if (!clean_build_outputs_dir(root_dir, &removed_any, diag)) {
+                return false;
+            }
+            if (!remove_target_outputs(root_dir, config, &removed_any, diag)) {
+                return false;
+            }
+        }
+        if ((mask & MAZEN_CLEAN_COMPDB) != 0 &&
+            !remove_optional_and_track(root_dir, compdb_path, &removed_any, diag)) {
+            return false;
         }
     }
 
@@ -786,6 +1011,9 @@ static void add_link_args(StringList *args, const BuildRequest *request, const B
     for (i = 0; i < units->len; ++i) {
         string_list_push(args, units->items[i].object_rel);
     }
+    for (i = 0; i < request->dependency_outputs.len; ++i) {
+        string_list_push(args, request->dependency_outputs.items[i]);
+    }
     string_list_push(args, "-o");
     string_list_push(args, output_rel);
     build_request_copy_list(args, &request->ldflags, false);
@@ -835,7 +1063,8 @@ static bool load_cached_dependencies(const CacheState *state, BuildUnit *unit) {
     return false;
 }
 
-static bool output_is_stale(const BuildUnitList *units, const char *output_abs, bool link_flags_changed) {
+static bool output_is_stale(const BuildUnitList *units, const BuildRequest *request, const char *output_abs,
+                            bool link_flags_changed) {
     long long output_time = file_mtime_ns(output_abs);
     size_t i;
 
@@ -844,6 +1073,11 @@ static bool output_is_stale(const BuildUnitList *units, const char *output_abs, 
     }
     for (i = 0; i < units->len; ++i) {
         if (file_mtime_ns(units->items[i].object_abs) > output_time) {
+            return true;
+        }
+    }
+    for (i = 0; i < request->dependency_outputs.len; ++i) {
+        if (dep_mtime("", request->dependency_outputs.items[i]) > output_time) {
             return true;
         }
     }
@@ -1161,6 +1395,7 @@ bool build_write_compile_database(const char *root_dir, const char *path, const 
 static bool run_built_program(const ProjectInfo *project, const BuildRequest *request, const char *output_rel,
                               Diagnostic *diag) {
     StringList args;
+    char *library_path;
 
     if (request->target_type != MAZEN_TARGET_EXECUTABLE) {
         diag_set(diag, "target `%s` is a %s and cannot be run",
@@ -1172,14 +1407,520 @@ static bool run_built_program(const ProjectInfo *project, const BuildRequest *re
     string_list_init(&args);
     string_list_push(&args, output_rel);
     build_request_copy_list(&args, &request->run_args, false);
+    library_path = library_path_value(&request->runtime_library_dirs);
     diag_info("Running %s", output_rel);
     fflush(stdout);
     fflush(stderr);
-    if (!run_command_passthrough(project->root_dir, &args, diag)) {
+    if (!((library_path == NULL && run_command_passthrough(project->root_dir, &args, diag)) ||
+          (library_path != NULL && run_command_passthrough_env(project->root_dir, &args, library_path, diag)))) {
+        free(library_path);
         string_list_free(&args);
         return false;
     }
+    free(library_path);
     string_list_free(&args);
+    return true;
+}
+
+static bool wait_for_pid_status(pid_t pid, int *exit_code, Diagnostic *diag) {
+    int status;
+
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            diag_set(diag, "failed waiting for child process: %s", strerror(errno));
+            return false;
+        }
+    }
+
+    if (WIFEXITED(status)) {
+        *exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        *exit_code = 128 + WTERMSIG(status);
+    } else {
+        *exit_code = 1;
+    }
+
+    return true;
+}
+
+typedef struct {
+    pid_t pid;
+    const ResolvedTarget *target;
+} RunningTest;
+
+static ssize_t find_running_test_slot(const RunningTest *running, size_t count, pid_t pid) {
+    size_t i;
+
+    for (i = 0; i < count; ++i) {
+        if (running[i].pid == pid) {
+            return (ssize_t) i;
+        }
+    }
+    return -1;
+}
+
+static ssize_t find_free_test_slot(const RunningTest *running, size_t count) {
+    size_t i;
+
+    for (i = 0; i < count; ++i) {
+        if (running[i].pid == 0) {
+            return (ssize_t) i;
+        }
+    }
+    return -1;
+}
+
+static bool launch_test_process(const ProjectInfo *project, const ResolvedTarget *target, pid_t *pid_out, Diagnostic *diag) {
+    StringList args;
+    char *library_path;
+    bool ok;
+
+    string_list_init(&args);
+    string_list_push(&args, target->output_path);
+    library_path = library_path_value(&target->runtime_library_dirs);
+    diag_info("Running test %s", target->name);
+    ok = spawn_command_env(project->root_dir, &args, library_path, pid_out, diag);
+    free(library_path);
+    string_list_free(&args);
+    return ok;
+}
+
+bool build_run_tests(const ProjectInfo *project, const ResolvedTargetList *targets, int jobs, bool parallel,
+                     const char *filter, Diagnostic *diag) {
+    size_t i;
+    size_t test_count = 0;
+    size_t failures = 0;
+    StringList failed;
+
+    (void) filter;
+    string_list_init(&failed);
+
+    for (i = 0; i < targets->len; ++i) {
+        if (targets->items[i].is_test) {
+            ++test_count;
+        }
+    }
+
+    if (test_count == 0) {
+        string_list_free(&failed);
+        diag_set(diag, "no test targets were selected");
+        return false;
+    }
+
+    if (!parallel) {
+        for (i = 0; i < targets->len; ++i) {
+            const ResolvedTarget *target = &targets->items[i];
+            pid_t pid;
+            int exit_code = 0;
+
+            if (!target->is_test) {
+                continue;
+            }
+            if (target->type != MAZEN_TARGET_EXECUTABLE) {
+                string_list_free(&failed);
+                diag_set(diag, "test target `%s` must be an executable", target->name);
+                return false;
+            }
+            if (!launch_test_process(project, target, &pid, diag)) {
+                string_list_free(&failed);
+                return false;
+            }
+            if (!wait_for_pid_status(pid, &exit_code, diag)) {
+                string_list_free(&failed);
+                return false;
+            }
+            if (exit_code != 0) {
+                ++failures;
+                string_list_push(&failed, target->name);
+                diag_warn("Test failed: %s (status %d)", target->name, exit_code);
+            }
+        }
+    } else {
+        long detected_jobs = sysconf(_SC_NPROCESSORS_ONLN);
+        size_t concurrency = (size_t) (jobs > 0 ? jobs : (detected_jobs > 0 ? detected_jobs : 1));
+        RunningTest *running;
+        size_t active = 0;
+        size_t next = 0;
+
+        if (concurrency < 1) {
+            concurrency = 1;
+        }
+
+        running = mazen_xcalloc(concurrency, sizeof(*running));
+        while (next < targets->len || active > 0) {
+            while (next < targets->len && active < concurrency) {
+                const ResolvedTarget *target = &targets->items[next++];
+                ssize_t slot;
+
+                if (!target->is_test) {
+                    continue;
+                }
+                if (target->type != MAZEN_TARGET_EXECUTABLE) {
+                    free(running);
+                    string_list_free(&failed);
+                    diag_set(diag, "test target `%s` must be an executable", target->name);
+                    return false;
+                }
+
+                slot = find_free_test_slot(running, concurrency);
+                if (slot < 0) {
+                    break;
+                }
+                if (!launch_test_process(project, target, &running[slot].pid, diag)) {
+                    free(running);
+                    string_list_free(&failed);
+                    return false;
+                }
+                running[slot].target = target;
+                ++active;
+            }
+
+            if (active > 0) {
+                int status;
+                pid_t pid;
+                ssize_t slot;
+                int exit_code;
+
+                while ((pid = waitpid(-1, &status, 0)) < 0) {
+                    if (errno != EINTR) {
+                        free(running);
+                        string_list_free(&failed);
+                        diag_set(diag, "failed waiting for test process: %s", strerror(errno));
+                        return false;
+                    }
+                }
+
+                slot = find_running_test_slot(running, concurrency, pid);
+                if (slot < 0) {
+                    free(running);
+                    string_list_free(&failed);
+                    diag_set(diag, "internal error: unknown test process finished");
+                    return false;
+                }
+
+                if (WIFEXITED(status)) {
+                    exit_code = WEXITSTATUS(status);
+                } else if (WIFSIGNALED(status)) {
+                    exit_code = 128 + WTERMSIG(status);
+                } else {
+                    exit_code = 1;
+                }
+
+                if (exit_code != 0) {
+                    ++failures;
+                    string_list_push(&failed, running[slot].target->name);
+                    diag_warn("Test failed: %s (status %d)", running[slot].target->name, exit_code);
+                }
+
+                running[slot].pid = 0;
+                running[slot].target = NULL;
+                --active;
+            }
+        }
+
+        free(running);
+    }
+
+    if (failures > 0) {
+        char *failed_names = format_item_list(&failed);
+        diag_set(diag, "%zu of %zu tests failed", failures, test_count);
+        if (failed_names != NULL && *failed_names != '\0') {
+            diag_set_hint(diag, "Failed tests: %s", failed_names);
+        }
+        free(failed_names);
+        string_list_free(&failed);
+        return false;
+    }
+
+    diag_info("All %zu test(s) passed", test_count);
+    string_list_free(&failed);
+    return true;
+}
+
+static char *selected_install_prefix(const ProjectInfo *project, const MazenConfig *config, const char *prefix_override) {
+    const char *prefix = prefix_override != NULL ? prefix_override
+                                                 : (config != NULL && config->install_prefix != NULL
+                                                        ? config->install_prefix
+                                                        : "/usr/local");
+    return resolve_path(project->root_dir, prefix);
+}
+
+static char *target_install_path(const ProjectInfo *project, const ResolvedTarget *target, const char *prefix_abs) {
+    const char *dir_name;
+    char *dir_path;
+    char *dst;
+
+    dir_name = target->install_dir != NULL ? target->install_dir
+                                           : (target->type == MAZEN_TARGET_EXECUTABLE ? "bin" : "lib");
+    if (path_is_absolute(dir_name)) {
+        dir_path = mazen_xstrdup(dir_name);
+    } else {
+        dir_path = path_join(prefix_abs, dir_name);
+    }
+    dst = path_join(dir_path, path_basename(target->output_path));
+    free(dir_path);
+    (void) project;
+    return dst;
+}
+
+static void collect_install_roots(const MazenConfig *config, const ResolvedTargetList *targets, StringList *roots) {
+    size_t i;
+
+    if (config != NULL) {
+        for (i = 0; i < config->include_dirs.len; ++i) {
+            if (strcmp(config->include_dirs.items[i], ".") != 0) {
+                string_list_push_unique(roots, config->include_dirs.items[i]);
+            }
+        }
+    }
+
+    for (i = 0; i < targets->len; ++i) {
+        size_t j;
+        for (j = 0; j < targets->items[i].include_dirs.len; ++j) {
+            if (strcmp(targets->items[i].include_dirs.items[j], ".") != 0) {
+                string_list_push_unique(roots, targets->items[i].include_dirs.items[j]);
+            }
+        }
+    }
+}
+
+static char *header_install_relative(const StringList *roots, const char *header_path) {
+    size_t i;
+
+    for (i = 0; i < roots->len; ++i) {
+        const char *relative = path_after_prefix_dir(header_path, roots->items[i]);
+        if (relative != NULL && *relative != '\0') {
+            return mazen_xstrdup(relative);
+        }
+    }
+
+    {
+        const char *relative = path_after_prefix_dir(header_path, "include");
+        if (relative != NULL && *relative != '\0') {
+            return mazen_xstrdup(relative);
+        }
+    }
+
+    return mazen_xstrdup(path_basename(header_path));
+}
+
+static void collect_install_headers(const ProjectInfo *project, const MazenConfig *config, const ResolvedTargetList *targets,
+                                    StringList *headers) {
+    size_t i;
+
+    if (config != NULL && config->install_headers.len > 0) {
+        for (i = 0; i < config->install_headers.len; ++i) {
+            string_list_push_unique(headers, config->install_headers.items[i]);
+        }
+        return;
+    }
+
+    {
+        StringList roots;
+
+        string_list_init(&roots);
+        collect_install_roots(config, targets, &roots);
+        for (i = 0; i < project->header_files.len; ++i) {
+            const char *header = project->header_files.items[i];
+            size_t j;
+            bool matched = false;
+
+            if (path_after_prefix_dir(header, "include") != NULL) {
+                string_list_push_unique(headers, header);
+                continue;
+            }
+            for (j = 0; j < roots.len; ++j) {
+                const char *relative = path_after_prefix_dir(header, roots.items[j]);
+                if (relative != NULL && *relative != '\0') {
+                    string_list_push_unique(headers, header);
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                continue;
+            }
+        }
+        string_list_free(&roots);
+    }
+}
+
+static bool install_headers(const ProjectInfo *project, const MazenConfig *config, const ResolvedTargetList *targets,
+                            const char *prefix_abs, Diagnostic *diag) {
+    StringList headers;
+    StringList roots;
+    size_t i;
+
+    string_list_init(&headers);
+    string_list_init(&roots);
+    collect_install_headers(project, config, targets, &headers);
+    collect_install_roots(config, targets, &roots);
+
+    for (i = 0; i < headers.len; ++i) {
+        char *src = resolve_path(project->root_dir, headers.items[i]);
+        char *relative = header_install_relative(&roots, headers.items[i]);
+        char *dst_dir = path_join(prefix_abs, "include");
+        char *dst = path_join(dst_dir, relative);
+
+        free(dst_dir);
+        free(relative);
+
+        if (!file_exists(src)) {
+            string_list_free(&roots);
+            string_list_free(&headers);
+            diag_set(diag, "install header `%s` does not exist", headers.items[i]);
+            free(src);
+            free(dst);
+            return false;
+        }
+        if (!ensure_parent_directory(project->root_dir, dst, diag)) {
+            string_list_free(&roots);
+            string_list_free(&headers);
+            free(src);
+            free(dst);
+            return false;
+        }
+        if (!copy_file_binary(src, dst)) {
+            string_list_free(&roots);
+            string_list_free(&headers);
+            diag_set(diag, "failed to install header `%s` to `%s`: %s", headers.items[i], dst, strerror(errno));
+            free(src);
+            free(dst);
+            return false;
+        }
+        diag_info("Installed %s", dst);
+        free(src);
+        free(dst);
+    }
+
+    string_list_free(&roots);
+    string_list_free(&headers);
+    return true;
+}
+
+bool build_install_targets(const ProjectInfo *project, const MazenConfig *config, const ResolvedTargetList *targets,
+                           const char *prefix, Diagnostic *diag) {
+    char *prefix_abs = selected_install_prefix(project, config, prefix);
+    bool installed_any = false;
+    size_t i;
+
+    for (i = 0; i < targets->len; ++i) {
+        const ResolvedTarget *target = &targets->items[i];
+        char *src;
+        char *dst;
+
+        if (!target->install_enabled) {
+            continue;
+        }
+
+        src = resolve_path(project->root_dir, target->output_path);
+        dst = target_install_path(project, target, prefix_abs);
+        if (!file_exists(src)) {
+            free(prefix_abs);
+            diag_set(diag, "target artifact `%s` was not built", target->output_path);
+            diag_set_hint(diag, "Build the target before installing");
+            free(src);
+            free(dst);
+            return false;
+        }
+        if (!ensure_parent_directory(project->root_dir, dst, diag)) {
+            free(prefix_abs);
+            free(src);
+            free(dst);
+            return false;
+        }
+        if (!copy_file_binary(src, dst)) {
+            free(prefix_abs);
+            diag_set(diag, "failed to install `%s` to `%s`: %s", src, dst, strerror(errno));
+            free(src);
+            free(dst);
+            return false;
+        }
+        diag_info("Installed %s", dst);
+        installed_any = true;
+        free(src);
+        free(dst);
+    }
+
+    if (!install_headers(project, config, targets, prefix_abs, diag)) {
+        free(prefix_abs);
+        return false;
+    }
+
+    if (!installed_any) {
+        diag_note("No installable target artifacts were selected");
+    }
+
+    free(prefix_abs);
+    return true;
+}
+
+bool build_uninstall_targets(const ProjectInfo *project, const MazenConfig *config, const ResolvedTargetList *targets,
+                             const char *prefix, Diagnostic *diag) {
+    char *prefix_abs = selected_install_prefix(project, config, prefix);
+    StringList headers;
+    StringList roots;
+    bool removed_any = false;
+    size_t i;
+
+    string_list_init(&headers);
+    string_list_init(&roots);
+    collect_install_headers(project, config, targets, &headers);
+    collect_install_roots(config, targets, &roots);
+
+    for (i = 0; i < targets->len; ++i) {
+        const ResolvedTarget *target = &targets->items[i];
+        char *dst;
+
+        if (!target->install_enabled) {
+            continue;
+        }
+
+        dst = target_install_path(project, target, prefix_abs);
+        if (file_exists(dst) || dir_exists(dst)) {
+            if (remove_tree(dst) != 0) {
+                string_list_free(&roots);
+                string_list_free(&headers);
+                free(prefix_abs);
+                diag_set(diag, "failed to remove `%s`: %s", dst, strerror(errno));
+                free(dst);
+                return false;
+            }
+            diag_info("Removed %s", dst);
+            removed_any = true;
+        }
+        free(dst);
+    }
+
+    for (i = 0; i < headers.len; ++i) {
+        char *relative = header_install_relative(&roots, headers.items[i]);
+        char *dst_dir = path_join(prefix_abs, "include");
+        char *dst = path_join(dst_dir, relative);
+
+        free(dst_dir);
+        free(relative);
+        if (file_exists(dst) || dir_exists(dst)) {
+            if (remove_tree(dst) != 0) {
+                string_list_free(&roots);
+                string_list_free(&headers);
+                free(prefix_abs);
+                diag_set(diag, "failed to remove `%s`: %s", dst, strerror(errno));
+                free(dst);
+                return false;
+            }
+            diag_info("Removed %s", dst);
+            removed_any = true;
+        }
+        free(dst);
+    }
+
+    if (!removed_any) {
+        diag_note("No installed artifacts were removed");
+    }
+
+    string_list_free(&roots);
+    string_list_free(&headers);
+    free(prefix_abs);
     return true;
 }
 
@@ -1324,7 +2065,7 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
         return false;
     }
 
-    if (output_is_stale(&units, output_abs, link_flags_changed || any_compiled)) {
+    if (output_is_stale(&units, request, output_abs, link_flags_changed || any_compiled)) {
         if (!link_target(project, request, &units, output_rel, &effective_libs, diag)) {
             free(output_rel);
             free(output_abs);

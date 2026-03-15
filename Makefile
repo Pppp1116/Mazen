@@ -15,6 +15,7 @@ SRC := \
 	src/config.c \
 	src/diag.c \
 	src/doctor.c \
+	src/profile.c \
 	src/scanner.c \
 	src/standard.c \
 	src/target.c
