@@ -45,6 +45,35 @@ static char *json_escape(const char *text) {
   return string_take(&escaped);
 }
 
+static void compdb_render_json(String *json, const CompDbEntryList *list) {
+  size_t i;
+
+  string_init(json);
+  string_append(json, "[\n");
+  for (i = 0; i < list->len; ++i) {
+    char *directory = json_escape(
+        list->items[i].directory != NULL ? list->items[i].directory : "");
+    char *file =
+        json_escape(list->items[i].file != NULL ? list->items[i].file : "");
+    char *command = json_escape(
+        list->items[i].command != NULL ? list->items[i].command : "");
+    char *output =
+        json_escape(list->items[i].output != NULL ? list->items[i].output : "");
+
+    string_appendf(json,
+                   "  "
+                   "{\"directory\":\"%s\",\"file\":\"%s\",\"command\":\"%s\","
+                   "\"output\":\"%s\"}%s\n",
+                   directory, file, command, output,
+                   i + 1 == list->len ? "" : ",");
+    free(directory);
+    free(file);
+    free(command);
+    free(output);
+  }
+  string_append(json, "]\n");
+}
+
 void compdb_entry_list_init(CompDbEntryList *list) {
   list->items = NULL;
   list->len = 0;
@@ -98,33 +127,28 @@ void compdb_entry_list_append(CompDbEntryList *dst, const CompDbEntryList *src) 
 
 bool compdb_write(const char *path, const CompDbEntryList *list,
                   Diagnostic *diag) {
+  return compdb_write_if_changed(path, list, NULL, diag);
+}
+
+bool compdb_write_if_changed(const char *path, const CompDbEntryList *list,
+                             bool *wrote_out, Diagnostic *diag) {
   String json;
-  size_t i;
+  char *existing;
+  size_t existing_len = 0;
+  bool wrote = false;
 
-  string_init(&json);
-  string_append(&json, "[\n");
-  for (i = 0; i < list->len; ++i) {
-    char *directory = json_escape(
-        list->items[i].directory != NULL ? list->items[i].directory : "");
-    char *file =
-        json_escape(list->items[i].file != NULL ? list->items[i].file : "");
-    char *command = json_escape(
-        list->items[i].command != NULL ? list->items[i].command : "");
-    char *output =
-        json_escape(list->items[i].output != NULL ? list->items[i].output : "");
-
-    string_appendf(&json,
-                   "  "
-                   "{\"directory\":\"%s\",\"file\":\"%s\",\"command\":\"%s\","
-                   "\"output\":\"%s\"}%s\n",
-                   directory, file, command, output,
-                   i + 1 == list->len ? "" : ",");
-    free(directory);
-    free(file);
-    free(command);
-    free(output);
+  compdb_render_json(&json, list);
+  existing = read_text_file(path, &existing_len);
+  if (existing != NULL && existing_len == json.len &&
+      memcmp(existing, json.data == NULL ? "" : json.data, json.len) == 0) {
+    free(existing);
+    string_free(&json);
+    if (wrote_out != NULL) {
+      *wrote_out = false;
+    }
+    return true;
   }
-  string_append(&json, "]\n");
+  free(existing);
 
   if (!write_text_file(path, json.data == NULL ? "" : json.data, json.len)) {
     diag_set(diag, "failed to write compile database `%s`", path);
@@ -132,6 +156,10 @@ bool compdb_write(const char *path, const CompDbEntryList *list,
     return false;
   }
 
+  wrote = true;
   string_free(&json);
+  if (wrote_out != NULL) {
+    *wrote_out = wrote;
+  }
   return true;
 }

@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MAZEN_AUTO_LIB_CACHE_VERSION 1U
+
 static void build_record_list_reserve(BuildRecordList *list, size_t needed) {
     size_t cap;
     if (list->cap >= needed) {
@@ -114,12 +116,15 @@ void build_record_list_free(BuildRecordList *list) {
 void cache_state_init(CacheState *state) {
     state->compile_signature = NULL;
     state->link_signature = NULL;
+    state->auto_libs_valid = false;
+    string_list_init(&state->auto_libs);
     build_record_list_init(&state->records);
 }
 
 void cache_state_free(CacheState *state) {
     free(state->compile_signature);
     free(state->link_signature);
+    string_list_free(&state->auto_libs);
     build_record_list_free(&state->records);
     cache_state_init(state);
 }
@@ -181,6 +186,13 @@ bool cache_save(const char *path, const CacheState *state, Diagnostic *diag) {
     string_init(&buffer);
     string_appendf(&buffer, "compile_signature=%s\n", compile_sig);
     string_appendf(&buffer, "link_signature=%s\n", link_sig);
+    string_appendf(&buffer, "auto_lib_cache_version=%u\n", MAZEN_AUTO_LIB_CACHE_VERSION);
+    string_appendf(&buffer, "auto_libs=%zu\n", state->auto_libs.len);
+    for (i = 0; i < state->auto_libs.len; ++i) {
+        char *auto_lib = escape_text(state->auto_libs.items[i]);
+        string_appendf(&buffer, "auto_lib=%s\n", auto_lib);
+        free(auto_lib);
+    }
     for (i = 0; i < state->records.len; ++i) {
         append_record(&buffer, &state->records.items[i]);
     }
@@ -234,6 +246,10 @@ bool cache_load(const char *path, CacheState *state, Diagnostic *diag) {
     char *line;
     BuildRecord *current = NULL;
     size_t expected_deps = 0;
+    size_t expected_auto_libs = 0;
+    bool saw_auto_lib_count = false;
+    bool saw_auto_lib_version = false;
+    unsigned int auto_lib_version = 0;
 
     if (!file_exists(path)) {
         return true;
@@ -281,6 +297,14 @@ bool cache_load(const char *path, CacheState *state, Diagnostic *diag) {
             } else if (strcmp(key, "link_signature") == 0) {
                 free(state->link_signature);
                 state->link_signature = unescape_text(value);
+            } else if (strcmp(key, "auto_lib_cache_version") == 0) {
+                saw_auto_lib_version = true;
+                auto_lib_version = (unsigned int) strtoul(value, NULL, 10);
+            } else if (strcmp(key, "auto_libs") == 0) {
+                saw_auto_lib_count = true;
+                expected_auto_libs = (size_t) strtoull(value, NULL, 10);
+            } else if (strcmp(key, "auto_lib") == 0) {
+                string_list_push_take(&state->auto_libs, unescape_text(value));
             }
             continue;
         }
@@ -300,6 +324,14 @@ bool cache_load(const char *path, CacheState *state, Diagnostic *diag) {
         } else if (strcmp(key, "dep_item") == 0) {
             string_list_push_take(&current->deps, unescape_text(value));
         }
+    }
+
+    if (saw_auto_lib_version && saw_auto_lib_count && auto_lib_version == MAZEN_AUTO_LIB_CACHE_VERSION &&
+        expected_auto_libs == state->auto_libs.len) {
+        state->auto_libs_valid = true;
+    } else {
+        string_list_clear(&state->auto_libs);
+        state->auto_libs_valid = false;
     }
 
     free(content);

@@ -22,5 +22,6 @@ void compdb_entry_list_free(CompDbEntryList *list);
 CompDbEntry *compdb_entry_list_push(CompDbEntryList *list);
 void compdb_entry_list_append(CompDbEntryList *dst, const CompDbEntryList *src);
 bool compdb_write(const char *path, const CompDbEntryList *list, Diagnostic *diag);
+bool compdb_write_if_changed(const char *path, const CompDbEntryList *list, bool *wrote_out, Diagnostic *diag);
 
 #endif

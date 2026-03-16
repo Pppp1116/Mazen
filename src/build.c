@@ -1084,6 +1084,38 @@ static bool output_is_stale(const BuildUnitList *units, const BuildRequest *requ
     return false;
 }
 
+static const BuildRecord *find_cached_record_const(const CacheState *state, const char *source_path) {
+    size_t i;
+
+    for (i = 0; i < state->records.len; ++i) {
+        const BuildRecord *record = &state->records.items[i];
+        if (record->source_path != NULL && strcmp(record->source_path, source_path) == 0) {
+            return record;
+        }
+    }
+
+    return NULL;
+}
+
+static bool auto_lib_cache_is_fresh(const ProjectInfo *project, const BuildRequest *request, const CacheState *state) {
+    size_t i;
+
+    if (!state->auto_libs_valid) {
+        return false;
+    }
+
+    for (i = 0; i < request->source_paths.len; ++i) {
+        const char *source_path = request->source_paths.items[i];
+        const BuildRecord *record = find_cached_record_const(state, source_path);
+
+        if (record == NULL || record->source_mtime_ns != dep_mtime(project->root_dir, source_path)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static void add_compdb_entry(CompDbEntryList *list, const ProjectInfo *project, const BuildUnit *unit,
                              const StringList *args) {
     CompDbEntry *entry = compdb_entry_list_push(list);
@@ -1364,13 +1396,17 @@ static bool link_target(const ProjectInfo *project, const BuildRequest *request,
 }
 
 static bool write_compile_database(const char *path, const CompDbEntryList *compdb, Diagnostic *diag) {
+    bool wrote = false;
+
     if (path == NULL) {
         return true;
     }
-    if (!compdb_write(path, compdb, diag)) {
+    if (!compdb_write_if_changed(path, compdb, &wrote, diag)) {
         return false;
     }
-    diag_info("Wrote %s", path);
+    if (wrote) {
+        diag_info("Wrote %s", path);
+    }
     return true;
 }
 
@@ -1986,17 +2022,6 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
     string_list_init(&auto_libs);
     string_list_init(&effective_libs);
 
-    build_request_copy_list(&effective_libs, &request->libs, true);
-    if (request->target_type != MAZEN_TARGET_STATIC_LIBRARY) {
-        autolib_infer(project->root_dir, &request->source_paths, &auto_libs);
-        build_request_copy_list(&effective_libs, &auto_libs, true);
-        if (auto_libs.len > 0) {
-            char *detected = format_item_list(&auto_libs);
-            diag_note("Auto-detected libraries: %s", detected);
-            free(detected);
-        }
-    }
-
     if (!create_build_units(project, request, &units, diag)) {
         string_list_free(&auto_libs);
         string_list_free(&effective_libs);
@@ -2021,6 +2046,8 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
         return false;
     }
 
+    build_request_copy_list(&effective_libs, &request->libs, true);
+
     if (!cache_load(cache_abs, &state, diag)) {
         free(output_rel);
         free(output_abs);
@@ -2034,6 +2061,23 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
         cache_state_free(&state);
         compdb_entry_list_free(&compdb);
         return false;
+    }
+
+    if (request->target_type != MAZEN_TARGET_STATIC_LIBRARY) {
+        if (auto_lib_cache_is_fresh(project, request, &state)) {
+            build_request_copy_list(&auto_libs, &state.auto_libs, false);
+        } else {
+            autolib_infer(project->root_dir, &request->source_paths, &auto_libs);
+            string_list_clear(&state.auto_libs);
+            build_request_copy_list(&state.auto_libs, &auto_libs, false);
+            state.auto_libs_valid = true;
+        }
+        build_request_copy_list(&effective_libs, &auto_libs, true);
+        if (auto_libs.len > 0) {
+            char *detected = format_item_list(&auto_libs);
+            diag_note("Auto-detected libraries: %s", detected);
+            free(detected);
+        }
     }
 
     make_signatures(request, &effective_libs, &compile_sig, &link_sig);

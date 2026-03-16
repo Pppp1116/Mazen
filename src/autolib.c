@@ -1178,6 +1178,10 @@ static bool is_identifier_char(char ch) {
     return isalnum((unsigned char) ch) || ch == '_';
 }
 
+static bool is_identifier_start_char(char ch) {
+    return isalpha((unsigned char) ch) || ch == '_';
+}
+
 static char *strip_comments_and_literals(const char *content) {
     String out;
     size_t i = 0;
@@ -1331,9 +1335,9 @@ static void collect_includes(const char *content, StringList *includes, StringLi
             }
             if (*cursor == terminator) {
                 char *path = string_take(&include);
-                string_list_push_unique(includes, path);
+                string_list_push(includes, path);
                 if (opener == '<') {
-                    string_list_push_unique(system_includes, path);
+                    string_list_push(system_includes, path);
                 }
                 free(path);
             } else {
@@ -1344,6 +1348,171 @@ static void collect_includes(const char *content, StringList *includes, StringLi
             ++cursor;
         }
     }
+}
+
+static void string_list_sort_unique(StringList *list) {
+    size_t i;
+    size_t write = 0;
+
+    if (list->len == 0) {
+        return;
+    }
+
+    string_list_sort(list);
+    for (i = 0; i < list->len; ++i) {
+        if (write > 0 && strcmp(list->items[write - 1], list->items[i]) == 0) {
+            free(list->items[i]);
+            continue;
+        }
+        list->items[write++] = list->items[i];
+    }
+    list->len = write;
+}
+
+static bool string_list_contains_sorted(const StringList *list, const char *item) {
+    return bsearch(&item, list->items, list->len, sizeof(*list->items), compare_cstrings) != NULL;
+}
+
+static size_t string_list_lower_bound(const StringList *list, const char *item) {
+    size_t left = 0;
+    size_t right = list->len;
+
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        if (strcmp(list->items[mid], item) < 0) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+
+    return left;
+}
+
+static bool string_list_contains_external_identifier(const StringList *identifiers, const StringList *defined_functions,
+                                                     const char *identifier) {
+    return string_list_contains_sorted(identifiers, identifier) &&
+           (defined_functions == NULL || !string_list_contains_sorted(defined_functions, identifier));
+}
+
+static bool string_list_contains_external_prefixed_identifier(const StringList *identifiers,
+                                                              const StringList *defined_functions,
+                                                              const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    size_t i = string_list_lower_bound(identifiers, prefix);
+
+    while (i < identifiers->len) {
+        const char *item = identifiers->items[i];
+
+        if (!string_starts_with(item, prefix)) {
+            return false;
+        }
+        if (is_identifier_char(item[prefix_len]) &&
+            (defined_functions == NULL || !string_list_contains_sorted(defined_functions, item))) {
+            return true;
+        }
+        ++i;
+    }
+
+    return false;
+}
+
+static void collect_call_identifiers(const char *text, StringList *identifiers) {
+    const char *cursor = text;
+
+    while (*cursor != '\0') {
+        const char *start;
+        const char *lookahead;
+        size_t len;
+        char *token;
+
+        while (*cursor != '\0' && !is_identifier_start_char(*cursor)) {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        start = cursor++;
+        while (is_identifier_char(*cursor)) {
+            ++cursor;
+        }
+        lookahead = cursor;
+        while (isspace((unsigned char) *lookahead)) {
+            ++lookahead;
+        }
+        if (*lookahead != '(') {
+            continue;
+        }
+
+        len = (size_t) (cursor - start);
+        token = mazen_xmalloc(len + 1);
+        memcpy(token, start, len);
+        token[len] = '\0';
+        string_list_push_take(identifiers, token);
+    }
+
+    string_list_sort_unique(identifiers);
+}
+
+static void collect_defined_functions(const char *text, StringList *identifiers) {
+    const char *cursor = text;
+
+    while (*cursor != '\0') {
+        const char *start;
+        const char *lookahead;
+        size_t depth;
+        size_t len;
+        char *token;
+
+        while (*cursor != '\0' && !is_identifier_start_char(*cursor)) {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        start = cursor++;
+        while (is_identifier_char(*cursor)) {
+            ++cursor;
+        }
+        lookahead = cursor;
+        while (isspace((unsigned char) *lookahead)) {
+            ++lookahead;
+        }
+        if (*lookahead != '(') {
+            continue;
+        }
+
+        depth = 1;
+        ++lookahead;
+        while (*lookahead != '\0' && depth > 0) {
+            if (*lookahead == '(') {
+                ++depth;
+            } else if (*lookahead == ')') {
+                --depth;
+            }
+            ++lookahead;
+        }
+        if (depth != 0) {
+            break;
+        }
+
+        while (isspace((unsigned char) *lookahead)) {
+            ++lookahead;
+        }
+        if (*lookahead != '{') {
+            continue;
+        }
+
+        len = (size_t) (cursor - start);
+        token = mazen_xmalloc(len + 1);
+        memcpy(token, start, len);
+        token[len] = '\0';
+        string_list_push_take(identifiers, token);
+    }
+
+    string_list_sort_unique(identifiers);
 }
 
 static bool contains_identifier(const char *text, const char *identifier) {
@@ -1376,14 +1545,7 @@ static bool contains_identifier_prefix(const char *text, const char *prefix) {
 }
 
 static bool includes_header(const StringList *includes, const char *header) {
-    size_t i;
-
-    for (i = 0; i < includes->len; ++i) {
-        if (strcmp(includes->items[i], header) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return string_list_contains_sorted(includes, header);
 }
 
 
@@ -1694,7 +1856,8 @@ static void maybe_add_pkgconfig_from_include(const char *include, StringList *li
     maybe_add_pkgconfig_token(include, libs);
 }
 
-static bool rule_matches(const AutoLibRule *rule, const StringList *includes, const char *text, bool allow_symbol_match) {
+static bool rule_matches(const AutoLibRule *rule, const StringList *includes, const StringList *identifiers,
+                         const StringList *defined_functions, const char *text, bool allow_symbol_match) {
     size_t i;
 
     for (i = 0; i < rule->header_count; ++i) {
@@ -1705,6 +1868,21 @@ static bool rule_matches(const AutoLibRule *rule, const StringList *includes, co
     if (!allow_symbol_match) {
         return false;
     }
+
+    if (identifiers != NULL) {
+        for (i = 0; i < rule->identifier_count; ++i) {
+            if (string_list_contains_external_identifier(identifiers, defined_functions, rule->identifiers[i])) {
+                return true;
+            }
+        }
+        for (i = 0; i < rule->prefix_count; ++i) {
+            if (string_list_contains_external_prefixed_identifier(identifiers, defined_functions, rule->prefixes[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     for (i = 0; i < rule->identifier_count; ++i) {
         if (contains_identifier(text, rule->identifiers[i])) {
             return true;
@@ -1728,6 +1906,16 @@ static void add_rule_libs(const AutoLibRule *rule, StringList *libs) {
 
 void autolib_infer(const char *root_dir, const StringList *source_paths, StringList *libs) {
     size_t i;
+    StringList includes;
+    StringList identifiers;
+    StringList defined_functions;
+    StringList system_includes;
+    size_t rule_index;
+
+    string_list_init(&includes);
+    string_list_init(&identifiers);
+    string_list_init(&defined_functions);
+    string_list_init(&system_includes);
 
     for (i = 0; i < source_paths->len; ++i) {
         char *absolute = path_join(root_dir, source_paths->items[i]);
@@ -1736,27 +1924,32 @@ void autolib_infer(const char *root_dir, const StringList *source_paths, StringL
         free(absolute);
         if (content != NULL) {
             char *sanitized = strip_comments_and_literals(content);
-            StringList includes;
-            StringList system_includes;
-            size_t rule_index;
-
-            string_list_init(&includes);
-            string_list_init(&system_includes);
             collect_includes(content, &includes, &system_includes);
-            for (rule_index = 0; rule_index < system_includes.len; ++rule_index) {
-                maybe_add_pkgconfig_from_include(system_includes.items[rule_index], libs);
-            }
-            for (rule_index = 0; rule_index < MAZEN_ARRAY_LEN(AUTO_LIB_RULES); ++rule_index) {
-                if (rule_matches(&AUTO_LIB_RULES[rule_index], &includes, sanitized, false)) {
-                    add_rule_libs(&AUTO_LIB_RULES[rule_index], libs);
-                }
-            }
-            string_list_free(&system_includes);
-            string_list_free(&includes);
+            collect_call_identifiers(sanitized, &identifiers);
+            collect_defined_functions(sanitized, &defined_functions);
             free(sanitized);
             free(content);
         }
     }
+
+    string_list_sort_unique(&includes);
+    string_list_sort_unique(&identifiers);
+    string_list_sort_unique(&defined_functions);
+    string_list_sort_unique(&system_includes);
+
+    for (rule_index = 0; rule_index < system_includes.len; ++rule_index) {
+        maybe_add_pkgconfig_from_include(system_includes.items[rule_index], libs);
+    }
+    for (rule_index = 0; rule_index < MAZEN_ARRAY_LEN(AUTO_LIB_RULES); ++rule_index) {
+        if (rule_matches(&AUTO_LIB_RULES[rule_index], &includes, &identifiers, &defined_functions, NULL, true)) {
+            add_rule_libs(&AUTO_LIB_RULES[rule_index], libs);
+        }
+    }
+
+    string_list_free(&system_includes);
+    string_list_free(&defined_functions);
+    string_list_free(&identifiers);
+    string_list_free(&includes);
 }
 
 bool autolib_infer_from_linker_output(const char *output, StringList *libs) {
@@ -1766,7 +1959,7 @@ bool autolib_infer_from_linker_output(const char *output, StringList *libs) {
 
     string_list_init(&empty_includes);
     for (i = 0; i < MAZEN_ARRAY_LEN(AUTO_LIB_RULES); ++i) {
-        if (rule_matches(&AUTO_LIB_RULES[i], &empty_includes, output, true)) {
+        if (rule_matches(&AUTO_LIB_RULES[i], &empty_includes, NULL, NULL, output, true)) {
             add_rule_libs(&AUTO_LIB_RULES[i], libs);
         }
     }

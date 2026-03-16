@@ -31,6 +31,14 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local haystack="$1"
+  local needle="$2"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    fail "expected output to not contain '$needle'"
+  fi
+}
+
 run_cmd() {
   local cwd="$1"
   shift
@@ -145,7 +153,37 @@ assert_contains "$OUT" "Target is up to date"
 run_cmd "$BUILD_APP" "$MAZEN_BIN" run
 assert_file "$BUILD_APP/compile_commands.json"
 
-note "Test 5: install and uninstall target + headers"
+note "Test 5: autolib infers libraries from symbol usage"
+AUTO_LIB_SYMBOL="$TMP_ROOT/auto_lib_symbol"
+mkdir -p "$AUTO_LIB_SYMBOL/src"
+cat > "$AUTO_LIB_SYMBOL/src/main.c" <<'SRC'
+double sqrt(double);
+int main(void) {
+  return sqrt(4.0) == 2.0 ? 0 : 1;
+}
+SRC
+OUT="$(run_capture "$AUTO_LIB_SYMBOL" "$MAZEN_BIN")"
+assert_contains "$OUT" "Auto-detected libraries: m"
+assert_file "$AUTO_LIB_SYMBOL/build/auto_lib_symbol"
+
+note "Test 6: autolib ignores project-local functions with library-like names"
+AUTO_LIB_LOCAL="$TMP_ROOT/auto_lib_local"
+mkdir -p "$AUTO_LIB_LOCAL/src"
+cat > "$AUTO_LIB_LOCAL/src/config.c" <<'SRC'
+void config_init(void) {}
+SRC
+cat > "$AUTO_LIB_LOCAL/src/main.c" <<'SRC'
+void config_init(void);
+int main(void) {
+  config_init();
+  return 0;
+}
+SRC
+OUT="$(run_capture "$AUTO_LIB_LOCAL" "$MAZEN_BIN")"
+assert_not_contains "$OUT" "Auto-detected libraries: config"
+assert_file "$AUTO_LIB_LOCAL/build/auto_lib_local"
+
+note "Test 7: install and uninstall target + headers"
 PREFIX="$TMP_ROOT/prefix"
 run_cmd "$GRAPH_OK" "$MAZEN_BIN" install --prefix "$PREFIX"
 assert_file "$PREFIX/bin/app"
@@ -154,7 +192,7 @@ run_cmd "$GRAPH_OK" "$MAZEN_BIN" uninstall --prefix "$PREFIX"
 assert_not_exists "$PREFIX/bin/app"
 assert_not_exists "$PREFIX/include/proj/math.h"
 
-note "Test 6: example projects build and run"
+note "Test 8: example projects build and run"
 cp -R "$ROOT_DIR/examples/simple" "$TMP_ROOT/example_simple"
 cp -R "$ROOT_DIR/examples/organized" "$TMP_ROOT/example_organized"
 OUT="$(run_capture "$TMP_ROOT/example_simple" "$ROOT_DIR/mazen" run)"

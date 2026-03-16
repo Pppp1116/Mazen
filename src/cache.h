@@ -22,6 +22,8 @@ typedef struct {
 typedef struct {
     char *compile_signature;
     char *link_signature;
+    bool auto_libs_valid;
+    StringList auto_libs;
     BuildRecordList records;
 } CacheState;
 
