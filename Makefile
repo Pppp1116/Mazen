@@ -22,7 +22,7 @@ SRC := \
 
 OBJ := $(SRC:.c=.o)
 
-.PHONY: all clean install
+.PHONY: all clean install test test-regression
 
 all: mazen
 
@@ -35,3 +35,9 @@ clean:
 install: mazen
 	install -d $(DESTDIR)/usr/local/bin
 	install -m 0755 mazen $(DESTDIR)/usr/local/bin/mazen
+
+
+test: test-regression
+
+test-regression: mazen
+	bash ./tests/regression.sh
