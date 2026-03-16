@@ -405,7 +405,7 @@ static void string_list_dedup_sorted(StringList *list) {
 
     write_index = 1;
     for (read_index = 1; read_index < list->len; ++read_index) {
-        if (strcmp(list->items[read_index - 1], list->items[read_index]) == 0) {
+        if (strcmp(list->items[write_index - 1], list->items[read_index]) == 0) {
             free(list->items[read_index]);
             continue;
         }
