@@ -391,8 +391,15 @@ static void add_include_root(StringList *roots, const char *path) {
     string_list_push_unique(roots, path);
 }
 
+static bool string_list_contains_sorted(const StringList *list, const char *item) {
+    return bsearch(&item, list->items, list->len, sizeof(*list->items), compare_cstrings) != NULL;
+}
+
 static void infer_include_roots(ProjectInfo *project, const ScanResult *scan, const MazenConfig *config) {
     size_t i, j;
+    StringList flat_includes;
+
+    string_list_init(&flat_includes);
 
     add_include_root(&project->include_dirs, ".");
     for (i = 0; i < config->include_dirs.len; ++i) {
@@ -417,32 +424,41 @@ static void infer_include_roots(ProjectInfo *project, const ScanResult *scan, co
             const char *include = source->includes.items[j];
             size_t k;
             if (strchr(include, '/') == NULL) {
-                for (k = 0; k < scan->header_files.len; ++k) {
-                    if (strcmp(path_basename(scan->header_files.items[k]), include) == 0) {
-                        char *dir = path_dirname(scan->header_files.items[k]);
-                        add_include_root(&project->include_dirs, dir);
-                        free(dir);
-                    }
-                }
-            } else {
-                for (k = 0; k < scan->header_files.len; ++k) {
-                    const char *header = scan->header_files.items[k];
-                    size_t header_len = strlen(header);
-                    size_t include_len = strlen(include);
-                    if (strcmp(header, include) == 0) {
-                        add_include_root(&project->include_dirs, ".");
-                    } else if (header_len > include_len &&
-                               strcmp(header + header_len - include_len, include) == 0 &&
-                               header[header_len - include_len - 1] == '/') {
-                        size_t root_len = header_len - include_len - 1;
-                        char *root = root_len == 0 ? mazen_xstrdup(".") : mazen_format("%.*s", (int) root_len, header);
-                        add_include_root(&project->include_dirs, root);
-                        free(root);
-                    }
+                string_list_push_unique(&flat_includes, include);
+                continue;
+            }
+
+            for (k = 0; k < scan->header_files.len; ++k) {
+                const char *header = scan->header_files.items[k];
+                size_t header_len = strlen(header);
+                size_t include_len = strlen(include);
+                if (strcmp(header, include) == 0) {
+                    add_include_root(&project->include_dirs, ".");
+                } else if (header_len > include_len &&
+                           strcmp(header + header_len - include_len, include) == 0 &&
+                           header[header_len - include_len - 1] == '/') {
+                    size_t root_len = header_len - include_len - 1;
+                    char *root = root_len == 0 ? mazen_xstrdup(".") : mazen_format("%.*s", (int) root_len, header);
+                    add_include_root(&project->include_dirs, root);
+                    free(root);
                 }
             }
         }
     }
+
+    if (flat_includes.len > 0) {
+        string_list_sort(&flat_includes);
+        for (i = 0; i < scan->header_files.len; ++i) {
+            const char *basename = path_basename(scan->header_files.items[i]);
+            if (string_list_contains_sorted(&flat_includes, basename)) {
+                char *dir = path_dirname(scan->header_files.items[i]);
+                add_include_root(&project->include_dirs, dir);
+                free(dir);
+            }
+        }
+    }
+
+    string_list_free(&flat_includes);
 }
 
 bool classifier_analyze(const char *root_dir, const ScanResult *scan, const MazenConfig *config, ProjectInfo *project,
