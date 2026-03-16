@@ -1,0 +1,12 @@
+# Build outputs
+/build/
+
+# Compiled objects and dependency files
+*.o
+*.d
+
+# Built executable
+/mazen
+
+# Tooling output
+/compile_commands.json
