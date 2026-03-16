@@ -12,5 +12,4 @@
 /compile_commands.json
 
 # Profiling artifacts
-gmon.out
 gmon.*
