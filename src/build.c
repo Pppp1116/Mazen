@@ -1118,6 +1118,10 @@ static bool auto_lib_cache_is_fresh(const ProjectInfo *project, const BuildReque
 
 static void add_compdb_entry(CompDbEntryList *list, const ProjectInfo *project, const BuildUnit *unit,
                              const StringList *args) {
+    if (list == NULL) {
+        return;
+    }
+
     CompDbEntry *entry = compdb_entry_list_push(list);
 
     entry->directory = mazen_xstrdup(project->root_dir);
@@ -1977,6 +1981,7 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
     char *link_sig = NULL;
     bool compile_flags_changed;
     bool link_flags_changed;
+    bool need_compdb_entries;
     bool any_compiled = false;
     bool did_link = false;
     (void) config;
@@ -2092,7 +2097,13 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
         diag_note("Compiler flags changed, invalidating object cache");
     }
 
-    if (!compile_units(project, request, &units, &state, compile_flags_changed, &compdb, &any_compiled, diag)) {
+    need_compdb_entries = compdb_out != NULL;
+    if (!need_compdb_entries && request->write_compile_commands) {
+        need_compdb_entries = compdb_abs == NULL || !file_exists(compdb_abs) || compile_flags_changed;
+    }
+
+    if (!compile_units(project, request, &units, &state, compile_flags_changed,
+                       need_compdb_entries ? &compdb : NULL, &any_compiled, diag)) {
         free(output_rel);
         free(output_abs);
         free(cache_rel);
@@ -2152,7 +2163,7 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
         compdb_entry_list_append(compdb_out, &compdb);
     }
 
-    if (request->write_compile_commands && !write_compile_database(compdb_abs, &compdb, diag)) {
+    if (request->write_compile_commands && need_compdb_entries && !write_compile_database(compdb_abs, &compdb, diag)) {
         free(output_rel);
         free(output_abs);
         free(cache_rel);
