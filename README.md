@@ -581,13 +581,157 @@ Every build also refreshes a compile database. By default this is
 `compile_commands_path`. Batch builds merge compile commands from every built
 target into a single compile database.
 
-MAZEN also tries to infer many common system libraries automatically from
-source usage, so projects using headers or symbols like `math.h`, `sqrt`,
-`pthread_create`, `dlopen`, `clock_gettime`, `curl_easy_init`,
-`sqlite3_open`, `g_object_new`, `pango_layout_new`, `libusb_init`, or
-`PQconnectdb` usually work without a manual `--lib` flag. Explicit
-`libs = [...]` and `--lib NAME` values still take precedence when you want to
-pin or extend the link set.
+### Library resolution (manual libs + auto-lib)
+
+For non-static targets, MAZEN resolves link libraries in layers:
+
+1. manual global libs (`libs = [...]` in top-level config)
+2. manual profile libs (`[profile.NAME].libs`)
+3. manual target libs (`[target.NAME].libs`, including propagated dependency target libs)
+4. auto-lib inference from the selected target's source files
+
+All layers are merged uniquely, so duplicates are removed while preserving
+the first-seen order.
+
+Auto-lib currently uses multiple heuristic signals:
+
+- known headers and call identifiers (for example `math.h` + `sqrt` => `-lm`)
+- identifier prefixes (for example `pthread_` => `-lpthread`)
+- pkg-config package lookup derived from system includes when available
+
+If the first link still fails with undefined references, MAZEN performs one
+retry pass by scanning linker output and appending any newly inferred
+libraries, then relinking.
+
+Current trade-off: this broad heuristic table gives wide coverage, but it can
+also produce false positives and adds scanning/maintenance overhead as rules
+grow.
+
+Notes:
+
+- Auto-lib is only applied to executable/shared-library links (not static
+  archive targets).
+- The inferred set is cached in `build/.mazen/*.state.txt` and reused when
+  source mtimes are unchanged (mtime-based freshness).
+- You can always force additional libraries with `--lib NAME` or config
+  `libs = [...]`.
+
+### Auto-lib confidence model (recommended next step)
+
+To reduce noise while preserving convenience, the next improvement is to split
+inference into confidence classes:
+
+- **High confidence:** exact header match + pkg-config resolution
+- **Medium confidence:** exact symbol/function match
+- **Low confidence:** prefix-only heuristics and linker-output retry guesses
+
+Recommended default behavior: auto-apply only high + medium confidence, and
+either log or gate low-confidence additions behind an explicit opt-in.
+
+## Build Performance Notes
+
+In large trees, the slowest stages are usually:
+
+1. **Initial recursive scan + source classification**
+   - walks the tree, stats files, and reads/parses each discovered `.c` file for
+     role/entrypoint/include inference
+2. **Cold compile phase**
+   - first build has no reusable object cache, so every target source compiles
+3. **Link phase (especially large executables/shared libs)**
+   - link is a single final step per target, so this is a serialization point
+4. **Auto-lib inference on cache miss**
+   - selected target sources are read and analyzed to infer external libs
+
+How MAZEN already makes this faster:
+
+- **Parallel compilation** via `-j/--jobs` (or auto CPU count when omitted)
+- **Incremental object rebuilds** using depfiles + cached timestamps/signatures
+- **Skip relink when up-to-date** using output/object/dependency timestamps and
+  link-signature tracking
+- **Auto-lib cache reuse** when source mtimes are unchanged
+- **Compile DB write-if-changed** to avoid unnecessary filesystem churn
+
+Parallelization today:
+
+- **Compile stage:** parallel, up to configured/auto job count
+- **Test execution:** optional parallel mode with `mazen test --parallel`
+- **Link stage:** currently one link process per target (not internally parallel)
+
+Does it adapt to different PCs? Yes:
+
+- If no job count is provided, MAZEN uses online CPU count from the host
+- You can override with `-j N` per machine/CI runner
+- Includes/libs/flags remain configurable per project/profile/target while
+  concurrency follows host capabilities by default
+
+Potential next improvements (if you want, I can implement these):
+
+- **No-op speed path first:**
+  - persist per-source extracted include/symbol fingerprints
+  - avoid reparsing depfiles until an object is actually reconsidered
+  - memoize repeated path normalization and command-string assembly in hot paths
+- **Cheaper auto-lib refresh:**
+  - cache extracted signals per source and only rescan changed files
+  - merge target-level inference from cached per-source signals
+  - persist "why this lib was inferred" for auditability
+- **Stronger cache keys:**
+  - move from mtime-only freshness toward lightweight content hashing of
+    extracted signals
+- **Scalability/robustness additions:**
+  - response-file support for very long compiler/link command lines
+  - optional parallel target builds for independent targets in `--all-targets`
+  - longer-term persistent worker/daemon model for lower process-spawn overhead
+
+### Performance and portability caveats (current state)
+
+- Process model is currently one compiler subprocess per source file
+  (`fork/execvp` style orchestration), which is robust but adds spawn overhead
+  on very large trees.
+- Link is currently a single command per target (with one optional retry after
+  linker-output-based inference), so link planning is intentionally simple.
+- The implementation is currently Clang-first and POSIX-first (`fork`, `execvp`,
+  `waitpid`, `ar`, `LD_LIBRARY_PATH`-style assumptions), which keeps Linux
+  workflows strong but narrows out-of-the-box portability.
+
+### Internal invariants (maintainer contract)
+
+When changing `build.c`, `autolib.c`, cache logic, or target propagation,
+these behavioral guarantees should remain true:
+
+- **Compile invalidation correctness:**
+  - rebuild when source, included headers, depfiles, or compile flags change.
+- **Link invalidation correctness:**
+  - relink when any linked object/library dependency or link flags change.
+- **Compile DB identity:**
+  - each compile context must be represented by its actual compile command;
+    shared sources used by different targets/flags must remain distinct entries.
+- **Auto-lib cache freshness:**
+  - inferred libraries must only be reused when tracked source state and
+    confidence mode are still compatible with the cached decision.
+- **Selective rebuild isolation:**
+  - unrelated targets should not recompile when only another target's sources
+    or private dependencies change.
+- **Diagnostic category accuracy:**
+  - graph failures, compilation failures, and linker failures must be reported
+    under the correct category with contextually-appropriate hints.
+
+The regression matrix in `tests/regression.sh` contains contract tests for all
+of the above and should stay green before merging behavior changes.
+
+### Performance baseline tracking
+
+Use the performance matrix script to compare machine-relative behavior over time:
+
+```sh
+bash tests/perf_matrix.sh
+# or:
+make test-perf
+```
+
+It reports clean/no-op/incremental timings, compile/link counts, auto-lib cache
+behavior, and `-j 1` vs `-j 8` scaling on generated fixture projects. This is
+intended for trend tracking ("faster/slower than previous commit"), not hard
+threshold gating across different machines.
 
 ## Tests, Profiles, And Installation
 
