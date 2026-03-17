@@ -1347,11 +1347,12 @@ static bool link_target(const ProjectInfo *project, const BuildRequest *request,
         } else {
             StringList retry_libs;
             bool retried = false;
+            bool allow_low_confidence = autolib_allow_low_confidence();
             string_list_init(&retry_libs);
             build_request_copy_list(&retry_libs, libs, true);
 
             if (autolib_infer_from_linker_output(output.data == NULL ? "" : output.data, &retry_libs,
-                                                autolib_allow_low_confidence()) &&
+                                                allow_low_confidence) &&
                 retry_libs.len > libs->len) {
                 char *detected = format_item_list(&retry_libs);
                 retried = true;
@@ -1388,7 +1389,14 @@ static bool link_target(const ProjectInfo *project, const BuildRequest *request,
                 if (hint != NULL) {
                     diag_set_hint(diag, "%s", hint);
                 } else if (!retried) {
-                    diag_set_hint(diag, "Add a library with `mazen --lib NAME` or `libs = [\"NAME\"]`");
+                    if (!allow_low_confidence) {
+                        diag_set_hint(diag,
+                                      "Add a library with `mazen --lib NAME` or `libs = [\"NAME\"]`. For "
+                                      "prefix/linker-output auto-lib retries, set "
+                                      "`MAZEN_AUTOLIB_LOW_CONFIDENCE=1`");
+                    } else {
+                        diag_set_hint(diag, "Add a library with `mazen --lib NAME` or `libs = [\"NAME\"]`");
+                    }
                 }
             }
             string_list_free(&retry_libs);

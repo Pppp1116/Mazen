@@ -8,6 +8,42 @@ if [[ ! -x "$MAZEN_BIN" ]]; then
   make -C "$ROOT_DIR" -j4
 fi
 
+count_matches() {
+  local pattern="$1"
+  local text="$2"
+  if command -v rg >/dev/null 2>&1; then
+    printf '%s\n' "$text" | rg -c "$pattern" || true
+  else
+    printf '%s\n' "$text" | grep -Ec "$pattern" || true
+  fi
+}
+
+now_ns() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY2'
+import time
+print(time.time_ns())
+PY2
+    return
+  fi
+  if command -v python >/dev/null 2>&1; then
+    python - <<'PY2'
+import time
+print(int(time.time() * 1_000_000_000))
+PY2
+    return
+  fi
+
+  local d
+  d=$(date +%s%N 2>/dev/null || true)
+  if [[ "$d" =~ ^[0-9]+$ && "$d" != *N ]]; then
+    printf '%s\n' "$d"
+  else
+    printf '[WARN] high-resolution timer unavailable; using second-resolution timing\n' >&2
+    printf '%s000000000\n' "$(date +%s)"
+  fi
+}
+
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
@@ -52,16 +88,14 @@ SRC
 done
 {
   for i in $(seq 1 36); do
-    printf 'int f%d(void);
-' "$i"
+    printf 'int f%d(void);\n' "$i"
   done
   printf 'int main(void) { return ('
   for i in $(seq 1 36); do
     printf 'f%d()' "$i"
     [[ $i -lt 36 ]] && printf '+'
   done
-  printf ') == 666 ? 0 : 1; }
-'
+  printf ') == 666 ? 0 : 1; }\n'
 } > "$SCALING/src/main.c"
 
 measure_case() {
@@ -69,22 +103,22 @@ measure_case() {
   local cwd="$2"
   shift 2
   local out rc start end elapsed_ms
-  start=$(date +%s%N)
+  start=$(now_ns)
   set +e
   out="$(cd "$cwd" && "$@" 2>&1)"
   rc=$?
   set -e
-  end=$(date +%s%N)
+  end=$(now_ns)
   elapsed_ms=$(( (end - start) / 1000000 ))
   local compiles links up_to_date autolib
-  compiles=$(printf '%s\n' "$out" | rg -c '^Compiling ' || true)
-  links=$(printf '%s\n' "$out" | rg -c '^Linking ' || true)
-  up_to_date=$(printf '%s\n' "$out" | rg -c 'Target is up to date' || true)
-  autolib=$(printf '%s\n' "$out" | rg -c 'Auto-detected libraries:' || true)
+  compiles=$(count_matches '^Compiling ' "$out")
+  links=$(count_matches '^Linking ' "$out")
+  up_to_date=$(count_matches 'Target is up to date' "$out")
+  autolib=$(count_matches 'Auto-detected libraries:' "$out")
   printf '%-34s rc=%d ms=%-6d compiles=%-3d links=%-2d up_to_date=%-2d autolib=%-2d\n' \
     "$label" "$rc" "$elapsed_ms" "$compiles" "$links" "$up_to_date" "$autolib"
   if [[ $rc -ne 0 ]]; then
-    printf '--- failure output (%s) ---\n%s\n' "$label" "$out"
+    printf -- '--- failure output (%s) ---\n%s\n' "$label" "$out"
     return "$rc"
   fi
 }

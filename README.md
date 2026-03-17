@@ -593,14 +593,23 @@ For non-static targets, MAZEN resolves link libraries in layers:
 All layers are merged uniquely, so duplicates are removed while preserving
 the first-seen order.
 
-Auto-lib currently uses multiple heuristic signals:
+Auto-lib currently uses confidence-gated heuristic signals:
 
-- known headers and call identifiers (for example `math.h` + `sqrt` => `-lm`)
-- identifier prefixes (for example `pthread_` => `-lpthread`)
-- pkg-config package lookup derived from system includes when available
+- **Always enabled (default):**
+  - known headers and exact call identifiers (for example `math.h` + `sqrt` => `-lm`)
+  - exact pkg-config token lookup derived from system includes when available
+- **Low-confidence mode only (`MAZEN_AUTOLIB_LOW_CONFIDENCE`):**
+  - identifier prefix matching (for example `pthread_` => `-lpthread`)
+  - fuzzy pkg-config matching from include-derived tokens
+  - linker-output retry inference on first link failure
 
-If the first link still fails with undefined references, MAZEN performs one
-retry pass by scanning linker output and appending any newly inferred
+Low-confidence mode is **off by default**. To enable it, set:
+
+- `MAZEN_AUTOLIB_LOW_CONFIDENCE=1`
+- accepted truthy values: `1`, `true`, `yes`, `on`
+
+When enabled, if the first link fails with undefined references, MAZEN performs
+one retry pass by scanning linker output and appending any newly inferred
 libraries, then relinking.
 
 Current trade-off: this broad heuristic table gives wide coverage, but it can
@@ -616,17 +625,16 @@ Notes:
 - You can always force additional libraries with `--lib NAME` or config
   `libs = [...]`.
 
-### Auto-lib confidence model (recommended next step)
+### Auto-lib confidence model (current behavior)
 
-To reduce noise while preserving convenience, the next improvement is to split
-inference into confidence classes:
+Auto-lib inference is split into confidence classes:
 
 - **High confidence:** exact header match + pkg-config resolution
 - **Medium confidence:** exact symbol/function match
 - **Low confidence:** prefix-only heuristics and linker-output retry guesses
 
-Recommended default behavior: auto-apply only high + medium confidence, and
-either log or gate low-confidence additions behind an explicit opt-in.
+Default behavior auto-applies high + medium confidence only. Low-confidence
+behaviors require explicit opt-in via `MAZEN_AUTOLIB_LOW_CONFIDENCE`.
 
 ## Build Performance Notes
 

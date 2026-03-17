@@ -1877,6 +1877,7 @@ static bool rule_matches(const AutoLibRule *rule, const StringList *includes, co
                 return true;
             }
         }
+        /* Prefix-based matching is intentionally low-confidence and opt-in. */
         if (allow_prefix_match) {
             for (i = 0; i < rule->prefix_count; ++i) {
                 if (string_list_contains_external_prefixed_identifier(identifiers, defined_functions, rule->prefixes[i])) {
@@ -1945,6 +1946,7 @@ void autolib_infer(const char *root_dir, const StringList *source_paths, StringL
     string_list_sort_unique(&system_includes);
 
     for (rule_index = 0; rule_index < system_includes.len; ++rule_index) {
+        /* Fuzzy pkg-config matching is only enabled in low-confidence mode. */
         maybe_add_pkgconfig_from_include(system_includes.items[rule_index], libs, allow_low_confidence);
     }
     for (rule_index = 0; rule_index < MAZEN_ARRAY_LEN(AUTO_LIB_RULES); ++rule_index) {
@@ -2007,6 +2009,7 @@ bool autolib_infer_from_linker_output(const char *output, StringList *libs, bool
     size_t before = libs->len;
     size_t i;
 
+    /* Linker-output retry inference is low-confidence and disabled by default. */
     if (!allow_low_confidence) {
         return false;
     }

@@ -48,6 +48,40 @@ assert_equals() {
   fi
 }
 
+
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$path" | awk '{print $NF}'
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY2' "$path"
+import hashlib, sys
+with open(sys.argv[1], 'rb') as f:
+    print(hashlib.sha256(f.read()).hexdigest())
+PY2
+    return
+  fi
+  if command -v python >/dev/null 2>&1; then
+    python - <<'PY2' "$path"
+import hashlib, sys
+with open(sys.argv[1], 'rb') as f:
+    print(hashlib.sha256(f.read()).hexdigest())
+PY2
+    return
+  fi
+  fail "no sha256 tool found (tried sha256sum, shasum, openssl, python3, python)"
+}
+
 run_cmd() {
   local cwd="$1"
   shift
@@ -485,10 +519,10 @@ int f10(void); int f11(void); int f12(void); int f13(void); int f14(void); int f
 int main(void) { return (f1()+f2()+f3()+f4()+f5()+f6()+f7()+f8()+f9()+f10()+f11()+f12()+f13()+f14()+f15()+f16()+f17()+f18()) == 171 ? 0 : 1; }
 SRC
 run_cmd "$PAR" "$MAZEN_BIN" -j 1
-SHA1_A="$(sha256sum "$PAR/build/parallel_eq" | awk '{print $1}')"
+SHA1_A="$(sha256_file "$PAR/build/parallel_eq")"
 run_cmd "$PAR" "$MAZEN_BIN" clean objects
 run_cmd "$PAR" "$MAZEN_BIN" -j 8
-SHA1_B="$(sha256sum "$PAR/build/parallel_eq" | awk '{print $1}')"
+SHA1_B="$(sha256_file "$PAR/build/parallel_eq")"
 assert_equals "$SHA1_A" "$SHA1_B"
 
 note "Test 19: compile_commands.json includes all source files"
@@ -776,7 +810,7 @@ entry = "src/main_c.c"
 sources = ["src/main_c.c"]
 TOML
 run_cmd "$XISO" "$MAZEN_BIN" --all-targets
-DB_BEFORE_SHA="$(sha256sum "$XISO/compile_commands.json" | awk '{print $1}')"
+DB_BEFORE_SHA="$(sha256_file "$XISO/compile_commands.json")"
 cat > "$XISO/src/b.c" <<'SRC'
 #include "b.h"
 int b_value(void) { return 9; }
@@ -785,7 +819,7 @@ OUT="$(run_capture "$XISO" "$MAZEN_BIN" --all-targets)"
 assert_contains "$OUT" "Compiling src/b.c"
 assert_contains "$OUT" "Linking build/a"
 assert_not_contains "$OUT" "Compiling src/main_c.c"
-DB_AFTER_SHA="$(sha256sum "$XISO/compile_commands.json" | awk '{print $1}')"
+DB_AFTER_SHA="$(sha256_file "$XISO/compile_commands.json")"
 assert_equals "$DB_BEFORE_SHA" "$DB_AFTER_SHA"
 
 note "Test 30: shared runtime matrix from build tree and installed prefix"
