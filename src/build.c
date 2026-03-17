@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -541,6 +542,20 @@ static const SourceFile *project_find_source(const ProjectInfo *project, const c
     }
 
     return NULL;
+}
+
+static bool string_list_same_items(const StringList *a, const StringList *b) {
+    size_t i;
+
+    if (a->len != b->len) {
+        return false;
+    }
+    for (i = 0; i < a->len; ++i) {
+        if (strcmp(a->items[i], b->items[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void make_signatures(const BuildRequest *request, const StringList *link_libs, char **compile_sig,
@@ -1084,36 +1099,38 @@ static bool output_is_stale(const BuildUnitList *units, const BuildRequest *requ
     return false;
 }
 
-static const BuildRecord *find_cached_record_const(const CacheState *state, const char *source_path) {
-    size_t i;
-
-    for (i = 0; i < state->records.len; ++i) {
-        const BuildRecord *record = &state->records.items[i];
-        if (record->source_path != NULL && strcmp(record->source_path, source_path) == 0) {
-            return record;
-        }
+static bool parse_env_truthy(const char *value) {
+    if (value == NULL) {
+        return false;
     }
-
-    return NULL;
+    return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "yes") == 0 ||
+           strcmp(value, "on") == 0;
 }
 
-static bool auto_lib_cache_is_fresh(const ProjectInfo *project, const BuildRequest *request, const CacheState *state) {
-    size_t i;
+static bool autolib_allow_low_confidence(void) {
+    static int cached = -1;
 
-    if (!state->auto_libs_valid) {
+    if (cached < 0) {
+        cached = parse_env_truthy(getenv("MAZEN_AUTOLIB_LOW_CONFIDENCE")) ? 1 : 0;
+    }
+
+    return cached == 1;
+}
+
+static void format_autolib_hash(uint64_t hash_value, char out[17]) {
+    snprintf(out, 17, "%016llx", (unsigned long long) hash_value);
+}
+
+static bool auto_lib_cache_is_fresh(const ProjectInfo *project, const BuildRequest *request, const CacheState *state,
+                                    bool allow_low_confidence, char current_hash[17]) {
+    if (!state->auto_libs_valid || state->auto_lib_source_hash == NULL || state->auto_lib_source_hash[0] == '\0' ||
+        state->auto_lib_low_confidence != allow_low_confidence) {
+        current_hash[0] = '\0';
         return false;
     }
 
-    for (i = 0; i < request->source_paths.len; ++i) {
-        const char *source_path = request->source_paths.items[i];
-        const BuildRecord *record = find_cached_record_const(state, source_path);
-
-        if (record == NULL || record->source_mtime_ns != dep_mtime(project->root_dir, source_path)) {
-            return false;
-        }
-    }
-
-    return true;
+    format_autolib_hash(autolib_source_hash(project->root_dir, &request->source_paths), current_hash);
+    return strcmp(state->auto_lib_source_hash, current_hash) == 0;
 }
 
 static void add_compdb_entry(CompDbEntryList *list, const ProjectInfo *project, const BuildUnit *unit,
@@ -1301,7 +1318,7 @@ static bool compile_units(const ProjectInfo *project, const BuildRequest *reques
 }
 
 static bool link_target(const ProjectInfo *project, const BuildRequest *request, const BuildUnitList *units,
-                        const char *output_rel, const StringList *libs, Diagnostic *diag) {
+                        const char *output_rel, const StringList *libs, bool allow_low_confidence, Diagnostic *diag) {
     StringList args;
     String output;
     size_t i;
@@ -1347,7 +1364,8 @@ static bool link_target(const ProjectInfo *project, const BuildRequest *request,
             string_list_init(&retry_libs);
             build_request_copy_list(&retry_libs, libs, true);
 
-            if (autolib_infer_from_linker_output(output.data == NULL ? "" : output.data, &retry_libs) &&
+            if (autolib_infer_from_linker_output(output.data == NULL ? "" : output.data, &retry_libs,
+                                                allow_low_confidence) &&
                 retry_libs.len > libs->len) {
                 char *detected = format_item_list(&retry_libs);
                 retried = true;
@@ -1384,7 +1402,14 @@ static bool link_target(const ProjectInfo *project, const BuildRequest *request,
                 if (hint != NULL) {
                     diag_set_hint(diag, "%s", hint);
                 } else if (!retried) {
-                    diag_set_hint(diag, "Add a library with `mazen --lib NAME` or `libs = [\"NAME\"]`");
+                    if (!allow_low_confidence) {
+                        diag_set_hint(diag,
+                                      "Add a library with `mazen --lib NAME` or `libs = [\"NAME\"]`. For "
+                                      "prefix/linker-output auto-lib retries, set "
+                                      "`MAZEN_AUTOLIB_LOW_CONFIDENCE=1`");
+                    } else {
+                        diag_set_hint(diag, "Add a library with `mazen --lib NAME` or `libs = [\"NAME\"]`");
+                    }
                 }
             }
             string_list_free(&retry_libs);
@@ -1981,6 +2006,8 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
     char *link_sig = NULL;
     bool compile_flags_changed;
     bool link_flags_changed;
+    bool allow_low_confidence = false;
+    bool autolib_inference_changed = false;
     bool need_compdb_entries;
     bool any_compiled = false;
     bool did_link = false;
@@ -2068,14 +2095,29 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
         return false;
     }
 
+    allow_low_confidence = autolib_allow_low_confidence();
+
     if (request->target_type != MAZEN_TARGET_STATIC_LIBRARY) {
-        if (auto_lib_cache_is_fresh(project, request, &state)) {
+        char source_hash[17];
+
+        if (auto_lib_cache_is_fresh(project, request, &state, allow_low_confidence, source_hash)) {
             build_request_copy_list(&auto_libs, &state.auto_libs, false);
         } else {
-            autolib_infer(project->root_dir, &request->source_paths, &auto_libs);
+            if (source_hash[0] == '\0') {
+                format_autolib_hash(autolib_source_hash(project->root_dir, &request->source_paths), source_hash);
+            }
+            autolib_infer(project->root_dir, &request->source_paths, &auto_libs, allow_low_confidence);
             string_list_clear(&state.auto_libs);
             build_request_copy_list(&state.auto_libs, &auto_libs, false);
+            if (state.auto_lib_source_hash != NULL && state.auto_lib_source_hash[0] != '\0' &&
+                strcmp(state.auto_lib_source_hash, source_hash) != 0 &&
+                !string_list_same_items(&state.auto_libs, &auto_libs)) {
+                autolib_inference_changed = true;
+            }
+            free(state.auto_lib_source_hash);
+            state.auto_lib_source_hash = mazen_xstrdup(source_hash);
             state.auto_libs_valid = true;
+            state.auto_lib_low_confidence = allow_low_confidence;
         }
         build_request_copy_list(&effective_libs, &auto_libs, true);
         if (auto_libs.len > 0) {
@@ -2086,7 +2128,8 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
     }
 
     make_signatures(request, &effective_libs, &compile_sig, &link_sig);
-    compile_flags_changed = state.compile_signature == NULL || strcmp(state.compile_signature, compile_sig) != 0;
+    compile_flags_changed =
+        state.compile_signature == NULL || strcmp(state.compile_signature, compile_sig) != 0 || autolib_inference_changed;
     link_flags_changed = state.link_signature == NULL || strcmp(state.link_signature, link_sig) != 0;
     free(state.compile_signature);
     free(state.link_signature);
@@ -2095,6 +2138,9 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
 
     if (compile_flags_changed) {
         diag_note("Compiler flags changed, invalidating object cache");
+        if (autolib_inference_changed) {
+            diag_note("Auto-lib inference changed, invalidating object cache");
+        }
     }
 
     need_compdb_entries = compdb_out != NULL;
@@ -2121,7 +2167,7 @@ bool build_project(const ProjectInfo *project, const MazenConfig *config, const 
     }
 
     if (output_is_stale(&units, request, output_abs, link_flags_changed || any_compiled)) {
-        if (!link_target(project, request, &units, output_rel, &effective_libs, diag)) {
+        if (!link_target(project, request, &units, output_rel, &effective_libs, allow_low_confidence, diag)) {
             free(output_rel);
             free(output_abs);
             free(cache_rel);

@@ -22,7 +22,7 @@ SRC := \
 
 OBJ := $(SRC:.c=.o)
 
-.PHONY: all clean install test test-regression
+.PHONY: all clean install test test-regression test-perf
 
 all: mazen
 
@@ -41,3 +41,7 @@ test: test-regression
 
 test-regression: mazen
 	bash ./tests/regression.sh
+
+
+test-perf: mazen
+	bash ./tests/perf_matrix.sh
