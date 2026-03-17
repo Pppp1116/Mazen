@@ -273,7 +273,7 @@ SourceFile *source_list_push(SourceList *list) {
     size_t cap;
 
     if (list->len == list->cap) {
-        cap = list->cap == 0 ? 8 : list->cap * 2;
+        cap = list->cap == 0 ? 32 : list->cap * 2;
         list->items = mazen_xrealloc(list->items, cap * sizeof(*list->items));
         list->cap = cap;
     }
@@ -385,15 +385,21 @@ bool path_has_component(const char *path, const char *component) {
     size_t component_len = strlen(component);
 
     while (*cursor != '\0') {
-        const char *slash = strchr(cursor, '/');
-        size_t len = slash == NULL ? strlen(cursor) : (size_t) (slash - cursor);
-        if (len == component_len && strncmp(cursor, component, len) == 0) {
+        const char *segment_start = cursor;
+        size_t len = 0;
+
+        while (*cursor != '\0' && *cursor != '/') {
+            ++cursor;
+            ++len;
+        }
+
+        if (len == component_len && memcmp(segment_start, component, len) == 0) {
             return true;
         }
-        if (slash == NULL) {
-            break;
+
+        if (*cursor == '/') {
+            ++cursor;
         }
-        cursor = slash + 1;
     }
 
     return false;

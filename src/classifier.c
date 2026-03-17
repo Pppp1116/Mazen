@@ -384,11 +384,34 @@ static bool better_entry_candidate(const SourceFile *lhs, const SourceFile *rhs)
     return strcmp(lhs->path, rhs->path) < 0;
 }
 
-static void add_include_root(StringList *roots, const char *path) {
+static void push_include_root_candidate(StringList *roots, const char *path) {
     if (path == NULL || path[0] == '\0') {
         return;
     }
-    string_list_push_unique(roots, path);
+    string_list_push(roots, path);
+}
+
+static bool string_list_contains_sorted(const StringList *list, const char *item) {
+    return bsearch(&item, list->items, list->len, sizeof(*list->items), compare_cstrings) != NULL;
+}
+
+static void string_list_dedup_sorted(StringList *list) {
+    size_t read_index;
+    size_t write_index;
+
+    if (list->len == 0) {
+        return;
+    }
+
+    write_index = 1;
+    for (read_index = 1; read_index < list->len; ++read_index) {
+        if (strcmp(list->items[write_index - 1], list->items[read_index]) == 0) {
+            free(list->items[read_index]);
+            continue;
+        }
+        list->items[write_index++] = list->items[read_index];
+    }
+    list->len = write_index;
 }
 
 static bool string_list_contains_sorted(const StringList *list, const char *item) {
@@ -401,20 +424,20 @@ static void infer_include_roots(ProjectInfo *project, const ScanResult *scan, co
 
     string_list_init(&flat_includes);
 
-    add_include_root(&project->include_dirs, ".");
+    push_include_root_candidate(&candidate_roots, ".");
     for (i = 0; i < config->include_dirs.len; ++i) {
-        add_include_root(&project->include_dirs, config->include_dirs.items[i]);
+        push_include_root_candidate(&candidate_roots, config->include_dirs.items[i]);
     }
     for (i = 0; i < scan->include_roots.len; ++i) {
-        add_include_root(&project->include_dirs, scan->include_roots.items[i]);
+        push_include_root_candidate(&candidate_roots, scan->include_roots.items[i]);
     }
     for (i = 0; i < project->source_roots.len; ++i) {
-        add_include_root(&project->include_dirs, project->source_roots.items[i]);
+        push_include_root_candidate(&candidate_roots, project->source_roots.items[i]);
     }
 
     for (i = 0; i < scan->header_files.len; ++i) {
         char *dir = path_dirname(scan->header_files.items[i]);
-        add_include_root(&project->include_dirs, dir);
+        push_include_root_candidate(&candidate_roots, dir);
         free(dir);
     }
 
