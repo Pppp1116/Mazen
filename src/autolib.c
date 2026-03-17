@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 typedef struct {
     const char *const *libs;
@@ -1780,7 +1781,7 @@ static void pkg_config_collect_packages(StringList *packages) {
     pclose(pipe);
 }
 
-static void maybe_add_pkgconfig_token(const char *token, StringList *libs) {
+static void maybe_add_pkgconfig_token(const char *token, StringList *libs, bool allow_fuzzy_match) {
     static StringList packages;
     static bool packages_init = false;
     static bool packages_loaded = false;
@@ -1809,7 +1810,7 @@ static void maybe_add_pkgconfig_token(const char *token, StringList *libs) {
         add_pkgconfig_libs(normalized + 3, libs);
     }
 
-    if (!pkg_config_exists()) {
+    if (!allow_fuzzy_match || !pkg_config_exists()) {
         return;
     }
 
@@ -1833,7 +1834,7 @@ static void maybe_add_pkgconfig_token(const char *token, StringList *libs) {
     }
 }
 
-static void maybe_add_pkgconfig_from_include(const char *include, StringList *libs) {
+static void maybe_add_pkgconfig_from_include(const char *include, StringList *libs, bool allow_fuzzy_match) {
     const char *slash;
     char token[256];
 
@@ -1847,17 +1848,18 @@ static void maybe_add_pkgconfig_from_include(const char *include, StringList *li
         if (head_len > 0 && head_len < sizeof(token)) {
             memcpy(token, include, head_len);
             token[head_len] = '\0';
-            maybe_add_pkgconfig_token(token, libs);
+            maybe_add_pkgconfig_token(token, libs, allow_fuzzy_match);
         }
-        maybe_add_pkgconfig_token(slash + 1, libs);
+        maybe_add_pkgconfig_token(slash + 1, libs, allow_fuzzy_match);
         return;
     }
 
-    maybe_add_pkgconfig_token(include, libs);
+    maybe_add_pkgconfig_token(include, libs, allow_fuzzy_match);
 }
 
 static bool rule_matches(const AutoLibRule *rule, const StringList *includes, const StringList *identifiers,
-                         const StringList *defined_functions, const char *text, bool allow_symbol_match) {
+                         const StringList *defined_functions, const char *text, bool allow_symbol_match,
+                         bool allow_prefix_match) {
     size_t i;
 
     for (i = 0; i < rule->header_count; ++i) {
@@ -1875,9 +1877,12 @@ static bool rule_matches(const AutoLibRule *rule, const StringList *includes, co
                 return true;
             }
         }
-        for (i = 0; i < rule->prefix_count; ++i) {
-            if (string_list_contains_external_prefixed_identifier(identifiers, defined_functions, rule->prefixes[i])) {
-                return true;
+        /* Prefix-based matching is intentionally low-confidence and opt-in. */
+        if (allow_prefix_match) {
+            for (i = 0; i < rule->prefix_count; ++i) {
+                if (string_list_contains_external_prefixed_identifier(identifiers, defined_functions, rule->prefixes[i])) {
+                    return true;
+                }
             }
         }
         return false;
@@ -1888,9 +1893,11 @@ static bool rule_matches(const AutoLibRule *rule, const StringList *includes, co
             return true;
         }
     }
-    for (i = 0; i < rule->prefix_count; ++i) {
-        if (contains_identifier_prefix(text, rule->prefixes[i])) {
-            return true;
+    if (allow_prefix_match) {
+        for (i = 0; i < rule->prefix_count; ++i) {
+            if (contains_identifier_prefix(text, rule->prefixes[i])) {
+                return true;
+            }
         }
     }
     return false;
@@ -1904,7 +1911,8 @@ static void add_rule_libs(const AutoLibRule *rule, StringList *libs) {
     }
 }
 
-void autolib_infer(const char *root_dir, const StringList *source_paths, StringList *libs) {
+void autolib_infer(const char *root_dir, const StringList *source_paths, StringList *libs,
+                  bool allow_low_confidence) {
     size_t i;
     StringList includes;
     StringList identifiers;
@@ -1938,10 +1946,12 @@ void autolib_infer(const char *root_dir, const StringList *source_paths, StringL
     string_list_sort_unique(&system_includes);
 
     for (rule_index = 0; rule_index < system_includes.len; ++rule_index) {
-        maybe_add_pkgconfig_from_include(system_includes.items[rule_index], libs);
+        /* Fuzzy pkg-config matching is only enabled in low-confidence mode. */
+        maybe_add_pkgconfig_from_include(system_includes.items[rule_index], libs, allow_low_confidence);
     }
     for (rule_index = 0; rule_index < MAZEN_ARRAY_LEN(AUTO_LIB_RULES); ++rule_index) {
-        if (rule_matches(&AUTO_LIB_RULES[rule_index], &includes, &identifiers, &defined_functions, NULL, true)) {
+        if (rule_matches(&AUTO_LIB_RULES[rule_index], &includes, &identifiers, &defined_functions, NULL, true,
+                         allow_low_confidence)) {
             add_rule_libs(&AUTO_LIB_RULES[rule_index], libs);
         }
     }
@@ -1952,14 +1962,81 @@ void autolib_infer(const char *root_dir, const StringList *source_paths, StringL
     string_list_free(&includes);
 }
 
-bool autolib_infer_from_linker_output(const char *output, StringList *libs) {
+
+static void stat_mtime_parts(const struct stat *st, long long *sec, long long *nsec) {
+#if defined(__APPLE__)
+    *sec = (long long) st->st_mtimespec.tv_sec;
+    *nsec = (long long) st->st_mtimespec.tv_nsec;
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    *sec = (long long) st->st_mtim.tv_sec;
+    *nsec = (long long) st->st_mtim.tv_nsec;
+#else
+    *sec = (long long) st->st_mtime;
+    *nsec = 0;
+#endif
+}
+
+static void stat_ctime_parts(const struct stat *st, long long *sec, long long *nsec) {
+#if defined(__APPLE__)
+    *sec = (long long) st->st_ctimespec.tv_sec;
+    *nsec = (long long) st->st_ctimespec.tv_nsec;
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    *sec = (long long) st->st_ctim.tv_sec;
+    *nsec = (long long) st->st_ctim.tv_nsec;
+#else
+    *sec = (long long) st->st_ctime;
+    *nsec = 0;
+#endif
+}
+
+uint64_t autolib_source_hash(const char *root_dir, const StringList *source_paths) {
+    uint64_t seed = 14695981039346656037ULL;
+    size_t i;
+
+    for (i = 0; i < source_paths->len; ++i) {
+        const char *source = source_paths->items[i];
+        char *absolute = path_join(root_dir, source);
+        struct stat st;
+
+        seed = fnv1a_hash_bytes(source, strlen(source), seed);
+        seed = fnv1a_hash_bytes("\n", 1, seed);
+
+        if (absolute != NULL && stat(absolute, &st) == 0) {
+            long long msec, mnsec, csec, cnsec;
+            char meta[160];
+            int written;
+
+            stat_mtime_parts(&st, &msec, &mnsec);
+            stat_ctime_parts(&st, &csec, &cnsec);
+            written = snprintf(meta, sizeof(meta), "%lld:%lld:%lld:%lld:%lld", (long long) st.st_size,
+                               msec, mnsec, csec, cnsec);
+            if (written > 0) {
+                seed = fnv1a_hash_bytes(meta, (size_t) written, seed);
+            }
+        } else {
+            seed = fnv1a_hash_bytes("missing", 7, seed);
+        }
+
+        seed = fnv1a_hash_bytes("\0", 1, seed);
+        free(absolute);
+    }
+
+    return seed;
+}
+
+bool autolib_infer_from_linker_output(const char *output, StringList *libs, bool allow_low_confidence) {
     StringList empty_includes;
     size_t before = libs->len;
     size_t i;
 
+    /* Linker-output retry inference is low-confidence and disabled by default. */
+    if (!allow_low_confidence) {
+        return false;
+    }
+
     string_list_init(&empty_includes);
     for (i = 0; i < MAZEN_ARRAY_LEN(AUTO_LIB_RULES); ++i) {
-        if (rule_matches(&AUTO_LIB_RULES[i], &empty_includes, NULL, NULL, output, true)) {
+        if (rule_matches(&AUTO_LIB_RULES[i], &empty_includes, NULL, NULL, output, true, true)) {
             add_rule_libs(&AUTO_LIB_RULES[i], libs);
         }
     }

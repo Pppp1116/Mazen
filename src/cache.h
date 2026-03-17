@@ -23,6 +23,8 @@ typedef struct {
     char *compile_signature;
     char *link_signature;
     bool auto_libs_valid;
+    bool auto_lib_low_confidence;
+    char *auto_lib_source_hash;
     StringList auto_libs;
     BuildRecordList records;
 } CacheState;

@@ -462,11 +462,25 @@ bool dir_exists(const char *path) {
 
 long long file_mtime_ns(const char *path) {
     struct stat st;
+    long long sec;
+    long long nsec;
 
     if (stat(path, &st) != 0) {
         return -1;
     }
-    return (long long) st.st_mtime * 1000000000LL;
+
+#if defined(__APPLE__)
+    sec = (long long) st.st_mtimespec.tv_sec;
+    nsec = (long long) st.st_mtimespec.tv_nsec;
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    sec = (long long) st.st_mtim.tv_sec;
+    nsec = (long long) st.st_mtim.tv_nsec;
+#else
+    sec = (long long) st.st_mtime;
+    nsec = 0;
+#endif
+
+    return sec * 1000000000LL + nsec;
 }
 
 static int mkdir_if_missing(const char *path) {
