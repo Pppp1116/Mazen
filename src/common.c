@@ -466,7 +466,7 @@ long long file_mtime_ns(const char *path) {
     if (stat(path, &st) != 0) {
         return -1;
     }
-    return (long long) st.st_mtime * 1000000000LL;
+    return (long long) st.st_mtim.tv_sec * 1000000000LL + (long long) st.st_mtim.tv_nsec;
 }
 
 static int mkdir_if_missing(const char *path) {

@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAZEN_AUTO_LIB_CACHE_VERSION 1U
+#define MAZEN_AUTO_LIB_CACHE_VERSION 2U
 
 static void build_record_list_reserve(BuildRecordList *list, size_t needed) {
     size_t cap;
@@ -117,6 +117,8 @@ void cache_state_init(CacheState *state) {
     state->compile_signature = NULL;
     state->link_signature = NULL;
     state->auto_libs_valid = false;
+    state->auto_lib_low_confidence = false;
+    state->auto_lib_source_hash = NULL;
     string_list_init(&state->auto_libs);
     build_record_list_init(&state->records);
 }
@@ -124,6 +126,7 @@ void cache_state_init(CacheState *state) {
 void cache_state_free(CacheState *state) {
     free(state->compile_signature);
     free(state->link_signature);
+    free(state->auto_lib_source_hash);
     string_list_free(&state->auto_libs);
     build_record_list_free(&state->records);
     cache_state_init(state);
@@ -187,6 +190,12 @@ bool cache_save(const char *path, const CacheState *state, Diagnostic *diag) {
     string_appendf(&buffer, "compile_signature=%s\n", compile_sig);
     string_appendf(&buffer, "link_signature=%s\n", link_sig);
     string_appendf(&buffer, "auto_lib_cache_version=%u\n", MAZEN_AUTO_LIB_CACHE_VERSION);
+    string_appendf(&buffer, "auto_lib_low_confidence=%d\n", state->auto_lib_low_confidence ? 1 : 0);
+    {
+        char *auto_hash = escape_text(state->auto_lib_source_hash == NULL ? "" : state->auto_lib_source_hash);
+        string_appendf(&buffer, "auto_lib_source_hash=%s\n", auto_hash);
+        free(auto_hash);
+    }
     string_appendf(&buffer, "auto_libs=%zu\n", state->auto_libs.len);
     for (i = 0; i < state->auto_libs.len; ++i) {
         char *auto_lib = escape_text(state->auto_libs.items[i]);
@@ -300,6 +309,11 @@ bool cache_load(const char *path, CacheState *state, Diagnostic *diag) {
             } else if (strcmp(key, "auto_lib_cache_version") == 0) {
                 saw_auto_lib_version = true;
                 auto_lib_version = (unsigned int) strtoul(value, NULL, 10);
+            } else if (strcmp(key, "auto_lib_low_confidence") == 0) {
+                state->auto_lib_low_confidence = atoi(value) != 0;
+            } else if (strcmp(key, "auto_lib_source_hash") == 0) {
+                free(state->auto_lib_source_hash);
+                state->auto_lib_source_hash = unescape_text(value);
             } else if (strcmp(key, "auto_libs") == 0) {
                 saw_auto_lib_count = true;
                 expected_auto_libs = (size_t) strtoull(value, NULL, 10);
@@ -331,7 +345,10 @@ bool cache_load(const char *path, CacheState *state, Diagnostic *diag) {
         state->auto_libs_valid = true;
     } else {
         string_list_clear(&state->auto_libs);
+        free(state->auto_lib_source_hash);
+        state->auto_lib_source_hash = NULL;
         state->auto_libs_valid = false;
+        state->auto_lib_low_confidence = false;
     }
 
     free(content);

@@ -8,6 +8,14 @@
 
 #define MAZEN_ARRAY_LEN(array) (sizeof(array) / sizeof((array)[0]))
 
+#if defined(__GNUC__) || defined(__clang__)
+#define MAZEN_PRINTF_LIKE(fmt_index, first_arg) __attribute__((format(printf, fmt_index, first_arg)))
+#define MAZEN_WARN_UNUSED_RESULT __attribute__((warn_unused_result))
+#else
+#define MAZEN_PRINTF_LIKE(fmt_index, first_arg)
+#define MAZEN_WARN_UNUSED_RESULT
+#endif
+
 typedef struct {
     char *data;
     size_t len;
@@ -95,12 +103,12 @@ typedef struct {
     bool multiple_entrypoints;
 } ProjectInfo;
 
-void *mazen_xmalloc(size_t size);
-void *mazen_xcalloc(size_t count, size_t size);
-void *mazen_xrealloc(void *ptr, size_t size);
-char *mazen_xstrdup(const char *text);
-char *mazen_vformat(const char *fmt, va_list args);
-char *mazen_format(const char *fmt, ...);
+void *mazen_xmalloc(size_t size) MAZEN_WARN_UNUSED_RESULT;
+void *mazen_xcalloc(size_t count, size_t size) MAZEN_WARN_UNUSED_RESULT;
+void *mazen_xrealloc(void *ptr, size_t size) MAZEN_WARN_UNUSED_RESULT;
+char *mazen_xstrdup(const char *text) MAZEN_WARN_UNUSED_RESULT;
+char *mazen_vformat(const char *fmt, va_list args) MAZEN_WARN_UNUSED_RESULT MAZEN_PRINTF_LIKE(1, 0);
+char *mazen_format(const char *fmt, ...) MAZEN_WARN_UNUSED_RESULT MAZEN_PRINTF_LIKE(1, 2);
 
 void string_init(String *string);
 void string_clear(String *string);
@@ -108,8 +116,8 @@ void string_free(String *string);
 void string_append(String *string, const char *text);
 void string_append_n(String *string, const char *text, size_t len);
 void string_append_char(String *string, char ch);
-void string_appendf(String *string, const char *fmt, ...);
-char *string_take(String *string);
+void string_appendf(String *string, const char *fmt, ...) MAZEN_PRINTF_LIKE(2, 3);
+char *string_take(String *string) MAZEN_WARN_UNUSED_RESULT;
 
 void string_list_init(StringList *list);
 void string_list_clear(StringList *list);
@@ -130,12 +138,12 @@ SourceFile *source_list_push(SourceList *list);
 void project_info_init(ProjectInfo *project);
 void project_info_free(ProjectInfo *project);
 
-char *mazen_getcwd(void);
-char *path_join(const char *lhs, const char *rhs);
-char *path_join3(const char *a, const char *b, const char *c);
-char *path_dirname(const char *path);
+char *mazen_getcwd(void) MAZEN_WARN_UNUSED_RESULT;
+char *path_join(const char *lhs, const char *rhs) MAZEN_WARN_UNUSED_RESULT;
+char *path_join3(const char *a, const char *b, const char *c) MAZEN_WARN_UNUSED_RESULT;
+char *path_dirname(const char *path) MAZEN_WARN_UNUSED_RESULT;
 const char *path_basename(const char *path);
-char *path_without_extension(const char *path);
+char *path_without_extension(const char *path) MAZEN_WARN_UNUSED_RESULT;
 bool path_has_component(const char *path, const char *component);
 size_t path_depth(const char *path);
 bool string_starts_with(const char *text, const char *prefix);
@@ -146,13 +154,13 @@ bool dir_exists(const char *path);
 long long file_mtime_ns(const char *path);
 int ensure_directory(const char *path);
 int remove_tree(const char *path);
-char *read_text_file(const char *path, size_t *len_out);
+char *read_text_file(const char *path, size_t *len_out) MAZEN_WARN_UNUSED_RESULT;
 bool write_text_file(const char *path, const char *data, size_t len);
 bool copy_file_binary(const char *src_path, const char *dst_path);
-char *sanitize_stem(const char *path);
+char *sanitize_stem(const char *path) MAZEN_WARN_UNUSED_RESULT;
 uint64_t fnv1a_hash_bytes(const void *data, size_t len, uint64_t seed);
 uint64_t fnv1a_hash_string(const char *text, uint64_t seed);
-char *hex_u64(uint64_t value);
+char *hex_u64(uint64_t value) MAZEN_WARN_UNUSED_RESULT;
 int compare_cstrings(const void *lhs, const void *rhs);
 
 const char *source_role_name(SourceRole role);
