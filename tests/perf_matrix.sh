@@ -34,11 +34,13 @@ fi
 count_matches() {
   local pattern="$1"
   local text="$2"
+  local count
   if [[ "$COUNT_BACKEND" == "rg" ]]; then
-    printf '%s\n' "$text" | rg -c "$pattern" || true
+    count="$(printf '%s\n' "$text" | rg -c "$pattern" || true)"
   else
-    printf '%s\n' "$text" | grep -Ec "$pattern" || true
+    count="$(printf '%s\n' "$text" | grep -Ec "$pattern" || true)"
   fi
+  printf '%s\n' "${count:-0}"
 }
 
 now_ns() {

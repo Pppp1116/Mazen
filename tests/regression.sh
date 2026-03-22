@@ -1047,4 +1047,123 @@ set -e
 assert_contains "$OUT" "target dependency cycle detected"
 assert_not_contains "$OUT" "Add a library with"
 
+note "Test 35: auto-mode include inference ignores unrelated example include roots"
+AUTO_INC="$TMP_ROOT/auto_include_scope"
+mkdir -p "$AUTO_INC/src" "$AUTO_INC/include/app" "$AUTO_INC/examples/include/app"
+cat > "$AUTO_INC/include/app/value.h" <<'HDR'
+#ifndef APP_VALUE_H
+#define APP_VALUE_H
+int app_value(void);
+#endif
+HDR
+cat > "$AUTO_INC/examples/include/app/value.h" <<'HDR'
+#error "example header leaked into the default target include path"
+HDR
+cat > "$AUTO_INC/src/value.c" <<'SRC'
+#include "app/value.h"
+int app_value(void) { return 7; }
+SRC
+cat > "$AUTO_INC/src/main.c" <<'SRC'
+#include "app/value.h"
+int main(void) { return app_value() == 7 ? 0 : 1; }
+SRC
+run_cmd "$AUTO_INC" "$MAZEN_BIN"
+assert_file "$AUTO_INC/build/auto_include_scope"
+run_cmd "$AUTO_INC" ./build/auto_include_scope
+
+note "Test 36: linux-kernel adapter delegates to Kbuild makefiles"
+KERNEL="$TMP_ROOT/kernel_like"
+mkdir -p "$KERNEL/arch/x86" "$KERNEL/scripts" "$KERNEL/scripts/clang-tools" "$KERNEL/kernel"
+cat > "$KERNEL/Kconfig" <<'KCONF'
+config FAKE
+	bool "fake"
+KCONF
+cat > "$KERNEL/scripts/clang-tools/gen_compile_commands.py" <<'PY2'
+#!/usr/bin/env python3
+from pathlib import Path
+Path("compile_commands.json").write_text(
+    '[{"directory":".","file":"kernel/main.c","command":"clang -c kernel/main.c","output":"build/main.o"}]\n',
+    encoding="utf-8",
+)
+PY2
+chmod +x "$KERNEL/scripts/clang-tools/gen_compile_commands.py"
+cat > "$KERNEL/kernel/main.c" <<'SRC'
+int kernel_main(void) { return 0; }
+SRC
+cat > "$KERNEL/Makefile" <<'MK'
+.PHONY: all clean help defconfig olddefconfig bzImage missing_host_tool missing_shared_lib
+
+all: .config vmlinux
+
+vmlinux:
+	test -f .config.synced
+	mkdir -p build
+	printf '%s\n' "cc=$(CC)" > build/vmlinux
+
+clean:
+	rm -rf build .config.synced
+
+help:
+	printf '%s\n' "defconfig"
+	printf '%s\n' "bzImage"
+
+defconfig:
+	printf '%s\n' "CONFIG_FAKE=y" > .config
+
+olddefconfig: .config
+	printf '%s\n' "CONFIG_SYNCED=y" >> .config
+	: > .config.synced
+
+bzImage: .config
+	test -f .config.synced
+	mkdir -p build
+	printf '%s\n' "bzImage cc=$(CC)" > build/bzImage
+
+missing_host_tool:
+	missing_kernel_tool
+
+missing_shared_lib:
+	printf '%s\n' "ld.lld: error while loading shared libraries: liblldELF.so.22.1: cannot open shared object file: No such file or directory" >&2
+	exit 127
+MK
+OUT="$(run_capture "$KERNEL" "$MAZEN_BIN" doctor)"
+assert_contains "$OUT" "Project adapter: linux-kernel"
+assert_contains "$OUT" "Delegated build system: make (Kbuild)"
+assert_contains "$OUT" "Kernel config: missing"
+assert_contains "$OUT" "Compile database: compile_commands.json via native helper"
+OUT="$(run_capture "$KERNEL" "$MAZEN_BIN" --target defconfig)"
+assert_file "$KERNEL/.config"
+assert_not_exists "$KERNEL/.config.synced"
+assert_not_exists "$KERNEL/compile_commands.json"
+OUT="$(run_capture "$KERNEL" "$MAZEN_BIN")"
+assert_file "$KERNEL/build/vmlinux"
+assert_file "$KERNEL/.config.synced"
+assert_file "$KERNEL/compile_commands.json"
+COMPDB_OUT="$(cat "$KERNEL/compile_commands.json")"
+assert_contains "$COMPDB_OUT" "kernel/main.c"
+OUT="$(run_capture "$KERNEL" "$MAZEN_BIN" --compiler clang --target bzImage)"
+assert_file "$KERNEL/build/bzImage"
+BZ_OUT="$(cat "$KERNEL/build/bzImage")"
+assert_contains "$BZ_OUT" "cc=clang"
+OUT="$(run_capture "$KERNEL" "$MAZEN_BIN" list)"
+assert_contains "$OUT" "defconfig"
+assert_contains "$OUT" "bzImage"
+set +e
+OUT="$(run_capture "$KERNEL" "$MAZEN_BIN" --target missing_host_tool)"
+RC=$?
+set -e
+[[ $RC -ne 0 ]] || fail "missing host tool case should fail"
+assert_contains "$OUT" "missing host tool \`missing_kernel_tool\`"
+assert_contains "$OUT" "Install \`missing_kernel_tool\` and rerun"
+set +e
+OUT="$(run_capture "$KERNEL" "$MAZEN_BIN" --target missing_shared_lib)"
+RC=$?
+set -e
+[[ $RC -ne 0 ]] || fail "missing shared library case should fail"
+assert_contains "$OUT" "\`ld.lld\` is missing shared library \`liblldELF.so.22.1\`"
+assert_contains "$OUT" "export LD_LIBRARY_PATH"
+run_cmd "$KERNEL" "$MAZEN_BIN" clean
+assert_not_exists "$KERNEL/build"
+assert_not_exists "$KERNEL/compile_commands.json"
+
 note "All regression checks passed"

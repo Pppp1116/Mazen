@@ -1,3 +1,4 @@
+#include "adapter.h"
 #include "build.h"
 #include "classifier.h"
 #include "cli.h"
@@ -13,6 +14,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef enum {
+    BUILD_PATH_GENERAL = 0,
+    BUILD_PATH_TOOL,
+    BUILD_PATH_EXAMPLE,
+    BUILD_PATH_TEST,
+    BUILD_PATH_EXPERIMENTAL
+} BuildPathContext;
+
+static const char *BUILD_CONTEXT_TOOL_NAMES[] = {"tool", "tools", "script", "scripts"};
+static const char *BUILD_CONTEXT_EXAMPLE_NAMES[] = {"example", "examples", "demo", "demos", "sample", "samples"};
+static const char *BUILD_CONTEXT_TEST_NAMES[] = {"test", "tests", "spec", "specs"};
+static const char *BUILD_CONTEXT_EXPERIMENT_NAMES[] = {
+    "experiment", "experiments", "old", "backup", "scratch", "playground"
+};
 
 static char *default_project_name(const char *root_dir) {
     const char *base = path_basename(root_dir);
@@ -34,6 +50,188 @@ static MazenBuildMode command_build_mode(MazenCommand command) {
     default:
         return MAZEN_BUILD_DEBUG;
     }
+}
+
+static bool path_matches_any_component(const char *path, const char *const *items, size_t count) {
+    size_t i;
+
+    for (i = 0; i < count; ++i) {
+        if (path_has_component(path, items[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool path_has_prefix_dir(const char *path, const char *prefix) {
+    size_t len = strlen(prefix);
+
+    if (strcmp(path, prefix) == 0) {
+        return true;
+    }
+    return string_starts_with(path, prefix) && path[len] == '/';
+}
+
+static const SourceFile *project_find_source_by_path(const ProjectInfo *project, const char *path) {
+    size_t i;
+
+    for (i = 0; i < project->sources.len; ++i) {
+        if (strcmp(project->sources.items[i].path, path) == 0) {
+            return &project->sources.items[i];
+        }
+    }
+
+    return NULL;
+}
+
+static BuildPathContext build_path_context(const char *path) {
+    if (path_matches_any_component(path, BUILD_CONTEXT_TEST_NAMES, MAZEN_ARRAY_LEN(BUILD_CONTEXT_TEST_NAMES))) {
+        return BUILD_PATH_TEST;
+    }
+    if (path_matches_any_component(path, BUILD_CONTEXT_EXAMPLE_NAMES,
+                                   MAZEN_ARRAY_LEN(BUILD_CONTEXT_EXAMPLE_NAMES))) {
+        return BUILD_PATH_EXAMPLE;
+    }
+    if (path_matches_any_component(path, BUILD_CONTEXT_EXPERIMENT_NAMES,
+                                   MAZEN_ARRAY_LEN(BUILD_CONTEXT_EXPERIMENT_NAMES))) {
+        return BUILD_PATH_EXPERIMENTAL;
+    }
+    if (path_matches_any_component(path, BUILD_CONTEXT_TOOL_NAMES, MAZEN_ARRAY_LEN(BUILD_CONTEXT_TOOL_NAMES))) {
+        return BUILD_PATH_TOOL;
+    }
+    return BUILD_PATH_GENERAL;
+}
+
+static bool context_allows_path(BuildPathContext target_context, const char *path) {
+    BuildPathContext path_context = build_path_context(path);
+
+    switch (target_context) {
+    case BUILD_PATH_TOOL:
+        return path_context == BUILD_PATH_GENERAL || path_context == BUILD_PATH_TOOL;
+    case BUILD_PATH_EXAMPLE:
+        return path_context == BUILD_PATH_GENERAL || path_context == BUILD_PATH_EXAMPLE;
+    case BUILD_PATH_TEST:
+        return path_context == BUILD_PATH_GENERAL || path_context == BUILD_PATH_TEST;
+    case BUILD_PATH_EXPERIMENTAL:
+        return path_context == BUILD_PATH_GENERAL || path_context == BUILD_PATH_EXPERIMENTAL;
+    case BUILD_PATH_GENERAL:
+    default:
+        return path_context == BUILD_PATH_GENERAL;
+    }
+}
+
+static BuildPathContext target_build_context(const ResolvedTarget *target) {
+    size_t i;
+
+    if (target == NULL) {
+        return BUILD_PATH_GENERAL;
+    }
+    if (target->is_test) {
+        return BUILD_PATH_TEST;
+    }
+    if (target->entry_path != NULL) {
+        return build_path_context(target->entry_path);
+    }
+    for (i = 0; i < target->source_paths.len; ++i) {
+        BuildPathContext source_context = build_path_context(target->source_paths.items[i]);
+        if (source_context != BUILD_PATH_GENERAL) {
+            return source_context;
+        }
+    }
+    return BUILD_PATH_GENERAL;
+}
+
+static void add_target_inferred_include_dirs(const ProjectInfo *project, const ResolvedTarget *target,
+                                             StringList *dirs) {
+    StringList flat_includes;
+    StringList path_includes;
+    BuildPathContext target_context;
+    size_t i;
+
+    if (target == NULL) {
+        for (i = 0; i < project->include_dirs.len; ++i) {
+            string_list_push_unique(dirs, project->include_dirs.items[i]);
+        }
+        return;
+    }
+
+    target_context = target_build_context(target);
+    string_list_init(&flat_includes);
+    string_list_init(&path_includes);
+
+    string_list_push_unique(dirs, ".");
+
+    for (i = 0; i < project->source_roots.len; ++i) {
+        size_t j;
+
+        if (!context_allows_path(target_context, project->source_roots.items[i])) {
+            continue;
+        }
+        for (j = 0; j < target->source_paths.len; ++j) {
+            if (path_has_prefix_dir(target->source_paths.items[j], project->source_roots.items[i])) {
+                string_list_push_unique(dirs, project->source_roots.items[i]);
+                break;
+            }
+        }
+    }
+
+    for (i = 0; i < target->source_paths.len; ++i) {
+        const SourceFile *source = project_find_source_by_path(project, target->source_paths.items[i]);
+        size_t j;
+
+        if (source == NULL) {
+            continue;
+        }
+        if (source->directory != NULL && context_allows_path(target_context, source->path)) {
+            string_list_push_unique(dirs, source->directory);
+        }
+        for (j = 0; j < source->includes.len; ++j) {
+            if (strchr(source->includes.items[j], '/') != NULL) {
+                string_list_push_unique(&path_includes, source->includes.items[j]);
+            } else {
+                string_list_push_unique(&flat_includes, source->includes.items[j]);
+            }
+        }
+    }
+
+    for (i = 0; i < path_includes.len; ++i) {
+        const char *include = path_includes.items[i];
+        size_t include_len = strlen(include);
+        size_t j;
+
+        for (j = 0; j < project->header_files.len; ++j) {
+            const char *header = project->header_files.items[j];
+            size_t header_len = strlen(header);
+
+            if (!context_allows_path(target_context, header)) {
+                continue;
+            }
+            if (strcmp(header, include) == 0) {
+                string_list_push_unique(dirs, ".");
+            } else if (header_len > include_len && strcmp(header + header_len - include_len, include) == 0 &&
+                       header[header_len - include_len - 1] == '/') {
+                size_t root_len = header_len - include_len - 1;
+                char *root =
+                    root_len == 0 ? mazen_xstrdup(".") : mazen_format("%.*s", (int) root_len, header);
+                string_list_push_unique_take(dirs, root);
+            }
+        }
+    }
+
+    for (i = 0; i < project->header_files.len; ++i) {
+        const char *header = project->header_files.items[i];
+
+        if (!context_allows_path(target_context, header)) {
+            continue;
+        }
+        if (string_list_contains(&flat_includes, path_basename(header))) {
+            char *dir = path_dirname(header);
+            string_list_push_unique_take(dirs, dir);
+        }
+    }
+
+    string_list_free(&path_includes);
+    string_list_free(&flat_includes);
 }
 
 static void populate_build_request(const CliOptions *cli, const MazenConfig *config, const ProjectInfo *project,
@@ -72,9 +270,8 @@ static void populate_build_request(const CliOptions *cli, const MazenConfig *con
     string_list_clear(&request->runtime_library_dirs);
     string_list_clear(&request->run_args);
 
-    for (i = 0; i < project->include_dirs.len; ++i) {
-        string_list_push_unique(&request->include_dirs, project->include_dirs.items[i]);
-    }
+    /* Keep auto-discovered include paths scoped to the active target. */
+    add_target_inferred_include_dirs(project, target, &request->include_dirs);
     for (i = 0; i < config->include_dirs.len; ++i) {
         string_list_push_unique(&request->include_dirs, config->include_dirs.items[i]);
     }
@@ -245,6 +442,7 @@ int main(int argc, char **argv) {
     ScanResult scan;
     ProjectInfo project;
     ResolvedTargetList targets;
+    MazenProjectAdapter adapter;
     const MazenProfile *profile = NULL;
     Diagnostic diag;
     char *root_dir = NULL;
@@ -255,6 +453,7 @@ int main(int argc, char **argv) {
     scan_result_init(&scan);
     project_info_init(&project);
     resolved_target_list_init(&targets);
+    mazen_project_adapter_init(&adapter);
     diag_init(&diag);
 
     if (!cli_parse(argc, argv, &cli, &diag)) {
@@ -289,26 +488,34 @@ int main(int argc, char **argv) {
         goto out;
     }
 
-    if (cli.command == MAZEN_CMD_CLEAN) {
-        if (!config_load(root_dir, &config, &diag)) {
-            diag_print_error(&diag);
-            exit_code = EXIT_FAILURE;
-            goto out;
-        }
-        config_merge_cli(&config, &cli);
-        if (!build_clean(root_dir, &config, cli.clean_mask_set ? cli.clean_mask : MAZEN_CLEAN_ALL, &diag)) {
+    if (!config_load(root_dir, &config, &diag)) {
+        diag_print_error(&diag);
+        exit_code = EXIT_FAILURE;
+        goto out;
+    }
+
+    if (!mazen_project_adapter_detect(root_dir, &config, &adapter)) {
+        diag_print_error(&diag);
+        exit_code = EXIT_FAILURE;
+        goto out;
+    }
+    if (mazen_project_adapter_is_active(&adapter)) {
+        if (!mazen_project_adapter_handle(&adapter, root_dir, &cli, &diag)) {
             diag_print_error(&diag);
             exit_code = EXIT_FAILURE;
         }
         goto out;
     }
 
-    if (!config_load(root_dir, &config, &diag)) {
-        diag_print_error(&diag);
-        exit_code = EXIT_FAILURE;
+    config_merge_cli(&config, &cli);
+
+    if (cli.command == MAZEN_CMD_CLEAN) {
+        if (!build_clean(root_dir, &config, cli.clean_mask_set ? cli.clean_mask : MAZEN_CLEAN_ALL, &diag)) {
+            diag_print_error(&diag);
+            exit_code = EXIT_FAILURE;
+        }
         goto out;
     }
-    config_merge_cli(&config, &cli);
 
     if (!scanner_scan(root_dir, &config, &scan, &diag)) {
         diag_print_error(&diag);
@@ -346,7 +553,7 @@ int main(int argc, char **argv) {
         doctor_print_project(&project, &config, request.compiler, request.standard, request.mode,
                              profile != NULL ? profile->name : NULL,
                              targets.len > 0 ? &targets.items[targets.len - 1] : NULL, request.jobs,
-                             request.compile_commands_path);
+                             request.compile_commands_path, &request.include_dirs);
         doctor_print_resolved_targets(&targets);
         build_request_free(&request);
         break;

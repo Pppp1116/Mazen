@@ -174,6 +174,35 @@ mazen standards
 
 List supported C language standards and dialects.
 
+## Large Trees And Native Adapters
+
+For some very large projects, the right move is to stop pretending they are
+zero-config single-binary trees and hand control back to the native build
+system.
+
+Today MAZEN does this automatically for Linux kernel style source trees when no
+`mazen.toml` is present. In that mode:
+
+- `mazen`, `mazen build`, and `mazen release` delegate to Kbuild via `make`
+- `mazen --target GOAL` forwards a specific Kbuild goal such as `defconfig` or
+  `bzImage`
+- when `.config` already exists, normal builds refresh it with
+  `olddefconfig` first so auto mode does not block on interactive Kconfig
+  prompts
+- `mazen clean` delegates to `make clean` and also removes
+  `compile_commands.json`
+- `mazen doctor` reports adapter details instead of generic source discovery
+- if `scripts/clang-tools/gen_compile_commands.py` is present, MAZEN refreshes
+  `compile_commands.json` through that native helper when needed
+
+Native Kbuild variables still work as usual because the delegated process
+inherits your environment:
+
+```sh
+ARCH=arm64 LLVM=1 mazen --target defconfig
+ARCH=arm64 LLVM=1 mazen --target Image
+```
+
 ## Language Standards
 
 MAZEN selects the C language standard using this precedence:

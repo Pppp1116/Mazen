@@ -8,7 +8,8 @@
 
 void doctor_print_project(const ProjectInfo *project, const MazenConfig *config, const char *compiler,
                           const MazenCStandard *standard, MazenBuildMode mode, const char *profile_name,
-                          const ResolvedTarget *target, int jobs, const char *compile_commands_path);
+                          const ResolvedTarget *target, int jobs, const char *compile_commands_path,
+                          const StringList *effective_include_dirs);
 void doctor_print_resolved_targets(const ResolvedTargetList *targets);
 void doctor_print_targets(const ProjectInfo *project);
 

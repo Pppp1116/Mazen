@@ -4,6 +4,7 @@ CFLAGS ?= -std=c17 -O2 -Wall -Wextra -Wpedantic
 LDFLAGS ?=
 
 SRC := \
+	src/adapter.c \
 	src/main.c \
 	src/autolib.c \
 	src/build.c \

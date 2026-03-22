@@ -18,7 +18,8 @@ static void print_string_list(const char *title, const StringList *list) {
 
 void doctor_print_project(const ProjectInfo *project, const MazenConfig *config, const char *compiler,
                           const MazenCStandard *standard, MazenBuildMode mode, const char *profile_name,
-                          const ResolvedTarget *target, int jobs, const char *compile_commands_path) {
+                          const ResolvedTarget *target, int jobs, const char *compile_commands_path,
+                          const StringList *effective_include_dirs) {
     size_t i;
 
     printf("Project root: %s\n", project->root_dir);
@@ -50,7 +51,11 @@ void doctor_print_project(const ProjectInfo *project, const MazenConfig *config,
     printf("Configuration: %s\n", config->present ? config->path : "(none)");
     printf("Sources: %zu\n", project->sources.len);
     print_string_list("Source roots:", &project->source_roots);
-    print_string_list("Include directories:", &project->include_dirs);
+    print_string_list("Effective include directories:",
+                      effective_include_dirs != NULL ? effective_include_dirs : &project->include_dirs);
+    if (effective_include_dirs != NULL) {
+        print_string_list("Discovered include directories:", &project->include_dirs);
+    }
     print_string_list("Vendor directories:", &project->vendor_dirs);
     print_string_list("Ignored directories:", &project->ignored_dirs);
     puts("Detected sources:");

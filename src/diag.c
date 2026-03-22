@@ -13,6 +13,7 @@ static void stream_print(FILE *stream, const char *prefix, const char *fmt, va_l
     fputs(prefix, stream);
     vfprintf(stream, fmt, args);
     fputc('\n', stream);
+    fflush(stream);
 }
 
 void diag_init(Diagnostic *diag) {
@@ -54,6 +55,7 @@ void diag_print_error(const Diagnostic *diag) {
     if (diag->hint != NULL) {
         fprintf(stderr, "hint: %s\n", diag->hint);
     }
+    fflush(stderr);
 }
 
 void diag_info(const char *fmt, ...) {
