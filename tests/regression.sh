@@ -1071,7 +1071,31 @@ run_cmd "$AUTO_INC" "$MAZEN_BIN"
 assert_file "$AUTO_INC/build/auto_include_scope"
 run_cmd "$AUTO_INC" ./build/auto_include_scope
 
-note "Test 36: linux-kernel adapter delegates to Kbuild makefiles"
+note "Test 36: doctor does not invent targets for non-C trees"
+NON_C="$TMP_ROOT/non_c_repo"
+mkdir -p "$NON_C/src"
+cat > "$NON_C/Cargo.toml" <<'TOML'
+[package]
+name = "non-c"
+version = "0.1.0"
+edition = "2021"
+TOML
+cat > "$NON_C/src/main.rs" <<'RS'
+fn main() {}
+RS
+OUT="$(run_capture "$NON_C" "$MAZEN_BIN" doctor)"
+assert_contains "$OUT" "Sources: 0"
+assert_contains "$OUT" "Resolved targets:"
+assert_contains "$OUT" "    (none)"
+assert_not_contains "$OUT" "Target: non_c_repo"
+set +e
+OUT="$(run_capture "$NON_C" "$MAZEN_BIN")"
+RC=$?
+set -e
+[[ $RC -ne 0 ]] || fail "non-C root should fail to build"
+assert_contains "$OUT" "no C source files were found"
+
+note "Test 37: linux-kernel adapter delegates to Kbuild makefiles"
 KERNEL="$TMP_ROOT/kernel_like"
 mkdir -p "$KERNEL/arch/x86" "$KERNEL/scripts" "$KERNEL/scripts/clang-tools" "$KERNEL/kernel"
 cat > "$KERNEL/Kconfig" <<'KCONF'

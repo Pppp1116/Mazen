@@ -1033,6 +1033,13 @@ static bool select_test_root(const ProjectInfo *project, const struct MazenConfi
 bool mazen_target_plan_build(const ProjectInfo *project, const struct MazenConfig *config, const char *requested_name,
                              bool all_targets, ResolvedTargetList *list, Diagnostic *diag) {
     if (config->targets.len == 0) {
+        if (project->sources.len == 0) {
+            if (requested_name != NULL) {
+                diag_set(diag, "target `%s` was requested, but no C source files were found", requested_name);
+                return false;
+            }
+            return true;
+        }
         if (all_targets) {
             return mazen_target_resolve_all(project, config, list, diag);
         }

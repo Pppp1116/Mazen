@@ -393,7 +393,11 @@ static bool build_targets(const CliOptions *cli, const MazenConfig *config, cons
     bool ok = false;
 
     if (targets->len == 0) {
-        diag_set(diag, "no buildable targets were resolved");
+        if (project->sources.len == 0) {
+            diag_set(diag, "no C source files were found in `%s`", project->root_dir);
+        } else {
+            diag_set(diag, "no buildable targets were resolved");
+        }
         return false;
     }
 
